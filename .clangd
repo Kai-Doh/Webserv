@@ -1,8 +1,0 @@
-# clangd doesn't read the Makefile, so it needs the same flags spelled
-# out here -- kept in sync with CXXFLAGS in Makefile. Note the include path
-# is ../include, not include: with no compile_commands.json, clangd's
-# fallback command resolves relative flags against each source file's own
-# directory (every .cpp here lives in srcs/), not the repo root the
-# Makefile itself is invoked from.
-CompileFlags:
-  Add: [-I../include, -std=c++98, -Wall, -Wextra, -Werror]
