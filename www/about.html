@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About — webserv</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/">web<span>serv</span></a>
+    <nav class="main">
+      <a href="/#features">Features</a>
+      <a href="/about.html">About</a>
+      <a href="/#downloads">Source</a>
+      <a href="/#contact">Contact</a>
+      <a href="/dashboard.html">Diagnostics</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <h1>About this project</h1>
+    <p class="lead">The HTTP + CGI half of a two-person 42 <em>Webserv</em> project:
+      request parsing, routing, and CGI execution, written in C++98.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap" style="max-width: 68ch; margin: 0 auto;">
+    <p>This page is one of two static files served straight from disk by the
+       server itself — no template engine, no build step. The rest of the
+       site (the homepage, the contact form, the file upload widget) all
+       route through the same request pipeline you'd hit with <code>curl</code>
+       or a raw socket.</p>
+    <p>Under the hood, a single non-blocking <code>poll()</code> loop watches
+       every client connection and every CGI pipe at once. Static files are
+       read straight off disk; anything with a configured CGI extension is
+       forked, executed, and its output streamed back — all without ever
+       blocking the rest of the server.</p>
+    <p>This particular route only answers <code>GET</code> requests — try a
+       <code>DELETE</code> against it from the
+       <a href="/dashboard.html">diagnostics page</a> to see the 405
+       response and its <code>Allow</code> header.</p>
+  </div>
+</section>
+
+<footer class="site">
+  <div class="wrap">
+    <span>webserv — a 42 project.</span>
+    <nav>
+      <a href="/">Home</a>
+      <a href="/listing/">Source</a>
+      <a href="/dashboard.html">Diagnostics</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

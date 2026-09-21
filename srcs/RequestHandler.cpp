@@ -1,0 +1,347 @@
+#include "connection.hpp"
+#include "RequestHandler.hpp"
+#include "CgiHandler.hpp"
+#include "HttpStatus.hpp"
+#include "StringUtils.hpp"
+
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+
+namespace {
+
+std::string joinPath(const std::string& root, const std::string& rel) {
+    if (rel.empty())
+        return root;
+    if (!root.empty() && root[root.size() - 1] == '/' && rel[0] == '/')
+        return root.substr(0, root.size() - 1) + rel;
+    if ((root.empty() || root[root.size() - 1] != '/') && (rel.empty() || rel[0] != '/'))
+        return root + "/" + rel;
+    return root + rel;
+}
+
+bool hasDotDotSegment(const std::string& rel) {
+    std::vector<std::string> segs = su::split(rel, '/');
+    for (size_t i = 0; i < segs.size(); ++i) {
+        if (segs[i] == "..")
+            return true;
+    }
+    return false;
+}
+
+std::string extensionOf(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+        return "";
+    return path.substr(dot);
+}
+
+std::string basenameOf(const std::string& path) {
+    size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos)
+        return path;
+    return path.substr(slash + 1);
+}
+
+// RFC 3875 (CGI/1.1) PATH_INFO: a request like /cgi-bin/script.py/extra/thing
+// names the script /cgi-bin/script.py with "/extra/thing" as extra path
+// information passed to it, not a 404. Walks `rel` one path segment at a
+// time looking for the first segment boundary that names an existing
+// regular file with a configured CGI extension; everything after it becomes
+// pathInfo. Only called as a fallback when the *whole* rel doesn't already
+// resolve to a file (see call site), so the common case (no trailing extra
+// path) never pays for this walk.
+bool resolveCgiScript(const Location& loc, const std::string& rel, std::string& scriptFsPath,
+                       std::string& pathInfo, std::string& interpreter) {
+    std::vector<std::string> segs = su::split(rel, '/');
+    std::string builtRel;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        builtRel += "/" + segs[i];
+        std::string candidate = joinPath(loc.root, builtRel);
+        struct stat st;
+        if (stat(candidate.c_str(), &st) != 0)
+            continue;  // no such entry yet at this depth: keep walking
+        if (!S_ISREG(st.st_mode))
+            continue;  // a directory component: the script must be further down
+        std::map<std::string, std::string>::const_iterator it =
+            loc.cgi_extensions.find(extensionOf(candidate));
+        if (it == loc.cgi_extensions.end())
+            return false;  // a regular file, but not a CGI script: no valid boundary here
+        scriptFsPath = candidate;
+        interpreter = it->second;
+        std::string remaining;
+        for (size_t j = i + 1; j < segs.size(); ++j)
+            remaining += "/" + segs[j];
+        pathInfo = remaining;
+        return true;
+    }
+    return false;
+}
+
+void serveFile(Connection& conn, const std::string& path, const struct stat& st) {
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file.is_open()) {
+        request_handler::writeErrorResponse(conn, 403);
+        return;
+    }
+    std::string body;
+    body.resize(static_cast<size_t>(st.st_size));
+    if (st.st_size > 0)
+        file.read(&body[0], st.st_size);
+    conn.status_code = 200;
+    request_handler::writeResponse(conn, 200, http_status::mimeType(path), body);
+}
+
+void serveAutoindex(Connection& conn, const std::string& fsDir, const std::string& reqPath) {
+    DIR* dir = opendir(fsDir.c_str());
+    if (dir == 0) {
+        request_handler::writeErrorResponse(conn, 403);
+        return;
+    }
+    std::string body = "<!DOCTYPE html>\n<html><head><title>Index of " + reqPath +
+                        "</title></head><body>\n<h1>Index of " + reqPath + "</h1>\n<ul>\n";
+    if (reqPath != "/")
+        body += "<li><a href=\"../\">../</a></li>\n";
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != 0) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..")
+            continue;
+        std::string full = joinPath(fsDir, name);
+        struct stat st;
+        std::string suffix;
+        if (stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            suffix = "/";
+        body += "<li><a href=\"" + name + suffix + "\">" + name + suffix + "</a></li>\n";
+    }
+    closedir(dir);
+    body += "</ul>\n<hr><p>webserv</p>\n</body></html>\n";
+    conn.status_code = 200;
+    request_handler::writeResponse(conn, 200, "text/html", body);
+}
+
+}  // namespace
+
+namespace request_handler {
+
+void writeResponse(Connection& conn, int code, const std::string& contentType,
+                    const std::string& body, const std::string& extraHeaders) {
+    std::ostringstream out;
+    std::string version = conn.http_version.empty() ? "HTTP/1.1" : conn.http_version;
+    out << version << " " << code << " " << http_status::reasonPhrase(code) << "\r\n";
+    out << "Server: webserv/1.0\r\n";
+    out << "Connection: " << (conn.keep_alive ? "keep-alive" : "close") << "\r\n";
+    if (!contentType.empty())
+        out << "Content-Type: " << contentType << "\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << extraHeaders;
+    out << "\r\n";
+    conn.write_buffer = out.str();
+    // RFC 7231 4.3.2: a response to HEAD must never carry a body, whatever
+    // the status code -- Content-Length still reports what GET would have
+    // sent. Sending the body anyway desyncs any client that (correctly)
+    // treats the connection as idle right after the headers, corrupting
+    // every request pipelined after it on the same keep-alive connection.
+    if (conn.method != "HEAD")
+        conn.write_buffer += body;
+    conn.bytes_written = 0;
+}
+
+void writeErrorResponse(Connection& conn, int code) {
+    if (conn.server_conf) {
+        std::map<int, std::string>::const_iterator it = conn.server_conf->error_pages.find(code);
+        if (it != conn.server_conf->error_pages.end()) {
+            std::ifstream file(it->second.c_str(), std::ios::binary);
+            if (file.is_open()) {
+                std::ostringstream buf;
+                buf << file.rdbuf();
+                writeResponse(conn, code, http_status::mimeType(it->second), buf.str());
+                return;
+            }
+        }
+    }
+    writeResponse(conn, code, "text/html", http_status::defaultErrorBody(code));
+}
+
+}  // namespace request_handler
+
+void handle_request(Connection& conn) {
+    if (conn.status_code != 0) {
+        request_handler::writeErrorResponse(conn, conn.status_code);
+        return;
+    }
+    if (!conn.server_conf) {
+        request_handler::writeErrorResponse(conn, 500);
+        return;
+    }
+
+    const Location* loc = conn.server_conf->matchLocation(conn.path);
+    if (!loc) {
+        conn.status_code = 404;
+        request_handler::writeErrorResponse(conn, 404);
+        return;
+    }
+
+    if (!loc->redirect_target.empty()) {
+        int code = loc->redirect_code ? loc->redirect_code : 302;
+        conn.status_code = code;
+        request_handler::writeResponse(conn, code, "text/html", "",
+                                        "Location: " + loc->redirect_target + "\r\n");
+        return;
+    }
+
+    if (!loc->methodAllowed(conn.method)) {
+        std::string allow;
+        for (size_t i = 0; i < loc->methods.size(); ++i) {
+            allow += loc->methods[i];
+            if (i + 1 < loc->methods.size())
+                allow += ", ";
+        }
+        conn.status_code = 405;
+        request_handler::writeResponse(conn, 405, "text/html", http_status::defaultErrorBody(405),
+                                        "Allow: " + allow + "\r\n");
+        return;
+    }
+
+    if (loc->root.empty()) {
+        request_handler::writeErrorResponse(conn, 500);
+        return;
+    }
+
+    // conn.path can be shorter than loc->path here: matchLocation() lets a
+    // "/directory/"-style location match the slash-less "/directory" too
+    // (so the redirect-to-trailing-slash logic below can fire instead of a
+    // spurious 404), and in that case there is no remainder to strip.
+    std::string rel = (conn.path.size() >= loc->path.size())
+                           ? conn.path.substr(loc->path.size())
+                           : "";
+    if (hasDotDotSegment(rel)) {
+        conn.status_code = 403;
+        request_handler::writeErrorResponse(conn, 403);
+        return;
+    }
+    std::string fsPath = joinPath(loc->root, rel);
+
+    struct stat st;
+    bool exists = (stat(fsPath.c_str(), &st) == 0);
+
+    if (conn.method == "DELETE") {
+        if (!exists) {
+            request_handler::writeErrorResponse(conn, 404);
+            return;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            request_handler::writeErrorResponse(conn, 403);
+            return;
+        }
+        if (std::remove(fsPath.c_str()) != 0) {
+            request_handler::writeErrorResponse(conn, 403);
+            return;
+        }
+        conn.status_code = 204;
+        request_handler::writeResponse(conn, 204, "", "");
+        return;
+    }
+
+    std::string cgiScriptFsPath;
+    std::string cgiInterpreter;
+    std::string cgiPathInfo;
+    bool isCgi = false;
+
+    if (exists && S_ISREG(st.st_mode)) {
+        std::map<std::string, std::string>::const_iterator cgiIt =
+            loc->cgi_extensions.find(extensionOf(fsPath));
+        if (cgiIt != loc->cgi_extensions.end()) {
+            cgiScriptFsPath = fsPath;
+            cgiInterpreter = cgiIt->second;
+            isCgi = true;
+        }
+    } else if (!loc->cgi_extensions.empty()) {
+        // The full path isn't a file, but a shorter prefix of it might be a
+        // CGI script with PATH_INFO trailing it (RFC 3875) -- e.g.
+        // /cgi-bin/script.py/extra/thing.
+        isCgi = resolveCgiScript(*loc, rel, cgiScriptFsPath, cgiPathInfo, cgiInterpreter);
+    }
+
+    if (isCgi) {
+        if (access(cgiScriptFsPath.c_str(), R_OK) != 0) {
+            request_handler::writeErrorResponse(conn, 403);
+            return;
+        }
+        conn.cgi_path_info = cgiPathInfo;
+        if (cgi_handler::start(conn, cgiScriptFsPath, cgiInterpreter, *loc))
+            conn.state = CGI_RUNNING;
+        return;
+    }
+
+    if (conn.method == "POST") {
+        if (!loc->upload_enabled) {
+            request_handler::writeErrorResponse(conn, 403);
+            return;
+        }
+        std::string filename = basenameOf(rel);
+        if (filename.empty()) {
+            std::ostringstream gen;
+            gen << "upload_" << static_cast<long>(getpid()) << "_" << conn.fd;
+            filename = gen.str();
+        }
+        std::string dest = joinPath(loc->upload_store, filename);
+        std::ofstream out(dest.c_str(), std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            request_handler::writeErrorResponse(conn, 500);
+            return;
+        }
+        if (!conn.body.empty())
+            out.write(conn.body.data(), static_cast<std::streamsize>(conn.body.size()));
+        out.close();
+        conn.status_code = 201;
+        request_handler::writeResponse(conn, 201, "text/plain", "Created\n",
+                                        "Location: " + conn.path + "\r\n");
+        return;
+    }
+
+    // Only GET remains: every other method was already turned away above
+    // by loc->methodAllowed() unless explicitly handled (DELETE, POST).
+    if (!exists) {
+        request_handler::writeErrorResponse(conn, 404);
+        return;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (conn.path.empty() || conn.path[conn.path.size() - 1] != '/') {
+            // Standard practice (nginx/Apache): a directory request without
+            // a trailing slash redirects to the slash-terminated form,
+            // rather than silently serving it -- relative links in the
+            // served page (autoindex entries, an index.html's own assets)
+            // are resolved against the URL path, so serving content at a
+            // slash-less path would break them.
+            std::string target = conn.path + "/";
+            if (!conn.query_string.empty())
+                target += "?" + conn.query_string;
+            conn.status_code = 301;
+            request_handler::writeResponse(conn, 301, "text/html", "",
+                                            "Location: " + target + "\r\n");
+            return;
+        }
+        if (!loc->index.empty()) {
+            std::string idx = joinPath(fsPath, loc->index);
+            struct stat ist;
+            if (stat(idx.c_str(), &ist) == 0 && S_ISREG(ist.st_mode)) {
+                serveFile(conn, idx, ist);
+                return;
+            }
+        }
+        if (loc->autoindex) {
+            serveAutoindex(conn, fsPath, conn.path);
+            return;
+        }
+        request_handler::writeErrorResponse(conn, 403);
+        return;
+    }
+
+    serveFile(conn, fsPath, st);
+}

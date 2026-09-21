@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webserv — a small HTTP server, built from scratch</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/">web<span>serv</span></a>
+    <nav class="main">
+      <a href="#features">Features</a>
+      <a href="/about.html">About</a>
+      <a href="#downloads">Source</a>
+      <a href="#contact">Contact</a>
+      <a href="/dashboard.html">Diagnostics</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <h1>A web server, held together by one <code>poll()</code> loop.</h1>
+    <p class="lead">Webserv is a non-blocking HTTP/1.1 server written from scratch in C++98 —
+      static files, CGI, uploads and config-driven routing, all multiplexed
+      through a single event loop, no threads.</p>
+    <div class="btn-row">
+      <a class="btn btn-primary" href="#downloads">Browse the source</a>
+      <a class="btn btn-ghost" href="#contact">Get in touch</a>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Under the hood</span>
+      <h2>What it does</h2>
+      <p>Every one of these runs through the exact same request pipeline this site is served from.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="icon">⟳</span>
+        <h3>Single-poll concurrency</h3>
+        <p>Every client socket and every CGI pipe is driven by one <code>poll()</code> call.
+           No thread per client, no blocking read or write, ever.</p>
+      </div>
+      <div class="card">
+        <span class="icon">⚙</span>
+        <h3>CGI out of the box</h3>
+        <p>Executes Python, PHP-CGI, or any interpreter you configure — full RFC&nbsp;3875
+           environment, chunked request un-chunking, and <code>PATH_INFO</code> support.</p>
+      </div>
+      <div class="card">
+        <span class="icon">🗺</span>
+        <h3>Config-driven routing</h3>
+        <p>nginx-style <code>server{}</code> / <code>location{}</code> blocks: per-route
+           methods, redirects, custom document roots, upload targets.</p>
+      </div>
+      <div class="card">
+        <span class="icon">⇅</span>
+        <h3>Uploads &amp; static files</h3>
+        <p>Serves a fully static site and accepts client uploads, through the
+           same non-blocking request/response cycle.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="downloads">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Take a look</span>
+      <h2>Poke around</h2>
+      <p>A couple of plain resources this server hands out exactly as configured.</p>
+    </div>
+    <div class="link-card">
+      <div>
+        <strong><a href="/listing/">/listing/</a></strong>
+        <span>A directory served with autoindex on — a handful of sample files.</span>
+      </div>
+      <a class="btn btn-ghost" href="/listing/">Open →</a>
+    </div>
+    <div class="link-card">
+      <div>
+        <strong><a href="/about.html">/about.html</a></strong>
+        <span>A little more about how this project came together.</span>
+      </div>
+      <a class="btn btn-ghost" href="/about.html">Read →</a>
+    </div>
+  </div>
+</section>
+
+<section id="contact">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Say hello</span>
+      <h2>Contact</h2>
+      <p>This form posts to a small Python CGI script — a real round trip through the server, not a mock.</p>
+    </div>
+    <form class="stack" onsubmit="return sendContact(event)">
+      <div>
+        <label for="name">Name</label>
+        <input type="text" id="name" name="name" required>
+      </div>
+      <div>
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email">
+      </div>
+      <div>
+        <label for="message">Message</label>
+        <textarea id="message" name="message" required></textarea>
+      </div>
+      <div>
+        <button class="btn btn-primary" type="submit">Send message</button>
+      </div>
+    </form>
+    <div class="result-box" id="contactResult"></div>
+  </div>
+</section>
+
+<footer class="site">
+  <div class="wrap">
+    <span>webserv — a 42 project. Served by itself, right now.</span>
+    <nav>
+      <a href="/about.html">About</a>
+      <a href="/listing/">Source</a>
+      <a href="/dashboard.html">Diagnostics</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+function sendContact(ev) {
+  ev.preventDefault();
+  var form = ev.target;
+  var body = new URLSearchParams({
+    name: form.name.value,
+    email: form.email.value,
+    message: form.message.value
+  }).toString();
+  fetch('/cgi-bin/contact.py', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body
+  }).then(function (r) { return r.text(); })
+    .then(function (html) {
+      var box = document.getElementById('contactResult');
+      box.innerHTML = html;
+      box.classList.add('show');
+      form.reset();
+    })
+    .catch(function () {
+      var box = document.getElementById('contactResult');
+      box.textContent = 'Could not reach the server. Please try again.';
+      box.classList.add('show');
+    });
+  return false;
+}
+</script>
+
+</body>
+</html>

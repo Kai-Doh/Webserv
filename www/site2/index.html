@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Second site — webserv :8081</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1.5rem;
+         color: #1c1b18; background: #fbfaf8; }
+  @media (prefers-color-scheme: dark) { body { color: #f2efe9; background: #171614; } }
+  code { background: rgba(128,128,128,.18); padding: .1rem .4rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>This is a different site.</h1>
+<p>Same <code>webserv</code> binary, same config file, a second
+<code>server{}</code> block listening on a different port
+(<code>127.0.0.1:8081</code>) with its own document root
+(<code>www/site2</code>) and its own <code>client_max_body_size</code>
+(10 bytes) — proving one process really does serve multiple distinct
+websites at once.</p>
+<p>See the <a href="http://127.0.0.1:8080/dashboard.html" style="color:inherit">main site's diagnostics page</a>
+(on port 8080) for the client-body-size-limit test against this server.</p>
+</body>
+</html>

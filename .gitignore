@@ -1,0 +1,10 @@
+# Build artifacts
+/webserv
+/objs/
+
+# Runtime upload targets: keep the directories (see .gitkeep), not their
+# contents, which are created/removed by the DELETE/upload tests.
+/www/upload/*
+!/www/upload/.gitkeep
+/www/site2/uploads/*
+!/www/site2/uploads/.gitkeep

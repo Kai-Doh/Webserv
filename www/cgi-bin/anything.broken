@@ -1,0 +1,4 @@
+This file's content is irrelevant -- it exists only so the server can find
+a regular, readable file at this path. The ".broken" extension is mapped in
+conf/test.conf to a nonexistent interpreter path, so execve() always fails
+and the CGI handler reports 502 Bad Gateway.

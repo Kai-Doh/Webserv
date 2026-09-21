@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostics — webserv</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+  .panel { max-width: 860px; }
+  .test-row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: .5rem 0; }
+  .test-row input[type=text] { flex: 1; min-width: 10rem; }
+  pre.out { background: var(--bg-alt); border: 1px solid var(--border); padding: .6rem .8rem;
+            border-radius: 8px; white-space: pre-wrap; word-break: break-all; min-height: 1.4rem;
+            font-size: .82rem; }
+  .status { font-weight: 700; }
+  .status.ok { color: #2a8f5c; }
+  .status.bad { color: #c8462f; }
+  h2.test { font-size: 1.05rem; margin: 2.2rem 0 .3rem; padding-top: 1.4rem; border-top: 1px solid var(--border); }
+  .test-hint { font-size: .85rem; color: var(--fg-muted); margin: .3rem 0 .6rem; }
+  code.block { display: block; background: var(--bg-alt); border: 1px solid var(--border);
+               padding: .7rem .9rem; border-radius: 8px; margin: .3rem 0; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="/">web<span>serv</span></a>
+    <nav class="main">
+      <a href="/">Home</a>
+      <a href="/about.html">About</a>
+      <a href="/#contact">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero" style="padding: 3rem 0 1.5rem;">
+  <div class="wrap">
+    <h1 style="font-size: 1.9rem;">Diagnostics</h1>
+    <p class="lead" style="font-size: 1rem;">Live checks against this same server (<code>conf/test.conf</code>,
+      port 8080), for anyone verifying the implementation rather than browsing the site.
+      Open the Network tab to inspect real request/response headers while clicking through.</p>
+  </div>
+</section>
+
+<section class="panel wrap" style="padding-top: 0;">
+
+  <h2 class="test">1. Static file serving</h2>
+  <div class="test-row">
+    <a href="/index.html">homepage</a> — <a href="/about.html">about.html</a>
+  </div>
+  <p class="test-hint">Two plain static files served straight from disk, no CGI/query involved.</p>
+
+  <h2 class="test">2. Directory listing (autoindex)</h2>
+  <div class="test-row"><a href="/listing/" target="_blank">/listing/</a></div>
+  <p class="test-hint"><code>autoindex on</code> in <code>conf/test.conf</code>; lists <code>a.txt</code>/<code>b.txt</code>.
+    <code>/</code> itself has <code>autoindex off</code> and an <code>index</code> file instead — compare the two.</p>
+
+  <h2 class="test">3. HTTP redirection</h2>
+  <div class="test-row"><a href="/old">/old</a> (expect 301 → /index.html)</div>
+  <p class="test-hint">Watch the URL bar / Network tab: <code>location /old { return 301 /index.html }</code>.</p>
+
+  <h2 class="test">4. Custom error page (404)</h2>
+  <div class="test-row"><a href="/this-does-not-exist" target="_blank">/this-does-not-exist</a></div>
+  <p class="test-hint">Should render <code>www/errors/404.html</code> (the config's <code>error_page 404</code>), not the built-in default.</p>
+
+  <h2 class="test">5. Method restrictions (405)</h2>
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="runFetch('DELETE', '/about.html', null, 'r5')">DELETE /about.html</button>
+    <span class="test-hint" style="margin:0">location <code>/</code> only allows <code>GET</code> → expect 405 with an <code>Allow</code> header</span>
+  </div>
+  <pre class="out" id="r5"></pre>
+
+  <h2 class="test">6. CGI over GET</h2>
+  <div class="test-row"><a href="/cgi-bin/hello.py?name=webserv" target="_blank">/cgi-bin/hello.py?name=webserv</a></div>
+  <p class="test-hint">Python CGI reading <code>REQUEST_METHOD</code>/<code>QUERY_STRING</code>/<code>SCRIPT_NAME</code> from its environment.</p>
+
+  <h2 class="test">6b. CGI PATH_INFO</h2>
+  <div class="test-row"><a href="/cgi-bin/pathinfo.py/extra/thing?x=1" target="_blank">/cgi-bin/pathinfo.py/extra/thing?x=1</a></div>
+  <p class="test-hint">RFC 3875 extra path info: <code>SCRIPT_NAME=/cgi-bin/pathinfo.py</code>, <code>PATH_INFO=/extra/thing</code>.</p>
+
+  <h2 class="test">7. CGI over POST</h2>
+  <form class="test-row" onsubmit="return submitCgi(event)">
+    <input type="text" id="cgiField" name="message" value="hello from the browser" placeholder="message">
+    <button class="btn btn-ghost" type="submit">POST to /cgi-bin/echo.py</button>
+  </form>
+  <pre class="out" id="r7"></pre>
+
+  <h2 class="test">8. File upload → GET → DELETE lifecycle</h2>
+  <div class="test-row">
+    <input type="file" id="uploadFile">
+    <button class="btn btn-ghost" onclick="doUpload()">Upload</button>
+  </div>
+  <div class="test-row" id="uploadActions" style="display:none">
+    <a id="uploadLink" target="_blank">view uploaded file</a>
+    <button class="btn btn-ghost" onclick="doDelete()">DELETE it</button>
+    <button class="btn btn-ghost" onclick="doVerifyGone()">Verify 404 after delete</button>
+  </div>
+  <pre class="out" id="r8"></pre>
+  <p class="test-hint">Uses <code>fetch(url, {method:'POST', body: file})</code> — sends the file's raw bytes as
+    the body (no multipart), matching the server's <code>location /upload { upload_store ... }</code> contract.</p>
+
+  <h2 class="test">9. Per-server body size limit (413)</h2>
+  <p class="test-hint">The second <code>server{}</code> block (port 8081, <a href="http://127.0.0.1:8081/" target="_blank">a genuinely different site</a>)
+    sets <code>client_max_body_size 10</code>. Cross-origin from this page, so use curl:</p>
+  <code class="block">curl -i -X POST --data "this is more than ten bytes" http://127.0.0.1:8081/
+# expect: 413 Payload Too Large
+
+curl -i -X POST --data "short" http://127.0.0.1:8081/
+# expect: 201 Created (5 bytes, within the 10-byte limit, upload_store configured there)</code>
+
+  <h2 class="test">10. Unknown method / malformed request (no crash)</h2>
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="runFetch('PATCH', '/index.html', null, 'r10')">Send PATCH /index.html</button>
+  </div>
+  <pre class="out" id="r10"></pre>
+  <p class="test-hint">For a truly malformed request line, use raw sockets:
+    <code>printf 'GARBAGE\r\n\r\n' | nc 127.0.0.1 8080</code> → <code>400 Bad Request</code>, server keeps running.</p>
+
+  <h2 class="test">11. HTTP status code coverage</h2>
+  <p class="test-hint">The eval sheet asks to verify every status code returned is accurate. This checks
+    every code this server produces, beyond what's already exercised above (200/201/204/301/404/405 in
+    sections 1–8). Codes not listed here (303, 307, 408, 409, 411, 501) are defined but never
+    produced by any current code path.</p>
+
+  <div class="test-row">
+    <a href="/moved">GET /moved</a>
+    <span class="test-hint" style="margin:0"><strong>302 Found</strong> — a second <code>return</code> code, to prove the config's redirect code isn't hardcoded to 301. A plain link, not a button: <code>fetch()</code> follows redirects transparently and can't expose the raw 302 — watch the Network tab instead.</span>
+  </div>
+
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="runFetch('DELETE', '/upload/', null, 'rc403a')">DELETE /upload/</button>
+    <span class="test-hint" style="margin:0"><strong>403 Forbidden</strong> — DELETE targeting a directory, not a file</span>
+  </div>
+  <pre class="out" id="rc403a"></pre>
+
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="runFetch('POST', '/cgi-bin/no-such-file.txt', 'x', 'rc403b')">POST /cgi-bin/no-such-file.txt</button>
+    <span class="test-hint" style="margin:0"><strong>403 Forbidden</strong> — POST to a location with no <code>upload_store</code> configured</span>
+  </div>
+  <pre class="out" id="rc403b"></pre>
+
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="test413()">POST a 2&nbsp;MB body to /upload/</button>
+    <span class="test-hint" style="margin:0"><strong>413 Payload Too Large</strong> — same-origin, against the 1&nbsp;MB <code>client_max_body_size</code> on :8080 itself</span>
+  </div>
+  <pre class="out" id="rc413"></pre>
+
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="test414()">GET / with a 9000-char query string</button>
+    <span class="test-hint" style="margin:0"><strong>414 URI Too Long</strong> — over the 8000-byte request-target limit</span>
+  </div>
+  <pre class="out" id="rc414"></pre>
+
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="test431()">GET / with a 10 KB header</button>
+    <span class="test-hint" style="margin:0"><strong>431 Request Header Fields Too Large</strong> — over the 8192-byte header-section limit</span>
+  </div>
+  <pre class="out" id="rc431"></pre>
+
+  <div class="test-row">
+    <a href="/cgi-bin/anything.broken" target="_blank">GET /cgi-bin/anything.broken</a>
+    <span class="test-hint" style="margin:0"><strong>502 Bad Gateway</strong> — <code>.broken</code> is mapped to a nonexistent interpreter path in the config; <code>execve()</code> fails</span>
+  </div>
+
+  <div class="test-row">
+    <button class="btn btn-ghost" onclick="test504()">GET /cgi-bin/hang.py <span class="test-hint" style="margin:0">(~10s)</span></button>
+    <span class="test-hint" style="margin:0"><strong>504 Gateway Timeout</strong> — a CGI that never terminates is killed after its deadline; the rest of the server stays responsive meanwhile</span>
+  </div>
+  <pre class="out" id="rc504"></pre>
+
+  <p class="test-hint">Not fetch-triggerable from a browser (both require sending bytes no compliant
+    HTTP client will ever construct) — raw sockets only:</p>
+  <code class="block">printf 'GET / HTTP/9.9\r\nHost: x\r\n\r\n' | nc 127.0.0.1 8080
+# 505 HTTP Version Not Supported
+
+printf 'GARBAGE\r\n\r\n' | nc 127.0.0.1 8080
+# 400 Bad Request (see section 10)</code>
+
+</section>
+
+<footer class="site">
+  <div class="wrap">
+    <span>webserv HTTP+CGI test harness — see README.md and guide_jour1_HTTP_CGI.md</span>
+    <nav><a href="/">Back to site</a></nav>
+  </div>
+</footer>
+
+<script>
+function show(id, status, headerLines, body) {
+  var el = document.getElementById(id);
+  var cls = (status >= 200 && status < 400) ? 'ok' : 'bad';
+  el.innerHTML = '<span class="status ' + cls + '">HTTP ' + status + '</span>\n' +
+                 headerLines.join('\n') + '\n\n' + (body || '').slice(0, 2000);
+}
+
+function runFetch(method, url, body, outId) {
+  return fetch(url, { method: method, body: body })
+    .then(function (r) {
+      var headers = [];
+      r.headers.forEach(function (v, k) { headers.push(k + ': ' + v); });
+      return r.text().then(function (t) { show(outId, r.status, headers, t); });
+    })
+    .catch(function (e) { show(outId, 0, [], 'fetch failed: ' + e); });
+}
+
+function submitCgi(ev) {
+  ev.preventDefault();
+  var msg = document.getElementById('cgiField').value;
+  fetch('/cgi-bin/echo.py', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'message=' + encodeURIComponent(msg)
+  }).then(function (r) {
+    var headers = [];
+    r.headers.forEach(function (v, k) { headers.push(k + ': ' + v); });
+    return r.text().then(function (t) { show('r7', r.status, headers, t); });
+  }).catch(function (e) { show('r7', 0, [], 'fetch failed: ' + e); });
+  return false;
+}
+
+var lastUploadUrl = null;
+
+function doUpload() {
+  var input = document.getElementById('uploadFile');
+  if (!input.files.length) {
+    show('r8', 0, [], 'pick a file first');
+    return;
+  }
+  var file = input.files[0];
+  var url = '/upload/' + encodeURIComponent(file.name);
+  fetch(url, { method: 'POST', body: file }).then(function (r) {
+    var headers = [];
+    r.headers.forEach(function (v, k) { headers.push(k + ': ' + v); });
+    return r.text().then(function (t) {
+      show('r8', r.status, headers, t);
+      if (r.status === 201) {
+        lastUploadUrl = url;
+        document.getElementById('uploadLink').href = url;
+        document.getElementById('uploadActions').style.display = '';
+      }
+    });
+  }).catch(function (e) { show('r8', 0, [], 'fetch failed: ' + e); });
+}
+
+function doDelete() {
+  if (!lastUploadUrl) return;
+  runFetch('DELETE', lastUploadUrl, null, 'r8');
+}
+
+function doVerifyGone() {
+  if (!lastUploadUrl) return;
+  runFetch('GET', lastUploadUrl, null, 'r8');
+}
+
+function test413() {
+  var body = new Uint8Array(2 * 1024 * 1024); // 2MB, over the 1MB server limit
+  runFetch('POST', '/upload/oversized-' + Date.now() + '.bin', body, 'rc413');
+}
+
+function test414() {
+  var longQuery = new Array(9001).join('a'); // 9000 chars, over the 8000-byte limit
+  runFetch('GET', '/?' + longQuery, null, 'rc414');
+}
+
+function test431() {
+  var bigValue = new Array(10001).join('a'); // 10KB header value, over the 8192-byte header-section limit
+  fetch('/', { headers: { 'X-Big': bigValue } }).then(function (r) {
+    var headers = [];
+    r.headers.forEach(function (v, k) { headers.push(k + ': ' + v); });
+    return r.text().then(function (t) { show('rc431', r.status, headers, t); });
+  }).catch(function (e) { show('rc431', 0, [], 'fetch failed: ' + e); });
+}
+
+function test504() {
+  show('rc504', 0, [], 'waiting on the 10s CGI deadline...');
+  runFetch('GET', '/cgi-bin/hang.py', null, 'rc504');
+}
+</script>
+
+</body>
+</html>
