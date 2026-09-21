@@ -17,6 +17,12 @@ namespace {
 
 const time_t CGI_TIMEOUT_SECONDS = 10;
 
+/**
+ * @brief Splits a filesystem path into its directory and filename parts.
+ * @param path Full path to split.
+ * @param dir  Set to the directory ("." if `path` had no '/').
+ * @param file Set to the filename.
+ */
 void splitDirFile(const std::string& path, std::string& dir, std::string& file) {
     size_t slash = path.find_last_of('/');
     if (slash == std::string::npos) {
@@ -30,6 +36,10 @@ void splitDirFile(const std::string& path, std::string& dir, std::string& file) 
     }
 }
 
+/**
+ * @brief Grabs our own PATH env var, to hand down to the CGI child.
+ * @return Our PATH value, or a sane fallback if somehow unset.
+ */
 std::string parentPath() {
     for (char** e = environ; *e != 0; ++e) {
         std::string entry(*e);
@@ -39,6 +49,12 @@ std::string parentPath() {
     return "/usr/bin:/bin";
 }
 
+/**
+ * @brief Builds the CGI/1.1 environment for one request (RFC 3875).
+ * @param conn       Parsed request the CGI is answering.
+ * @param scriptPath Resolved filesystem path of the script (SCRIPT_FILENAME).
+ * @return "KEY=value" strings ready for execve()'s envp.
+ */
 std::vector<std::string> buildEnv(const Connection& conn, const std::string& scriptPath) {
     // SCRIPT_NAME is conn.path with the trailing PATH_INFO (if any) removed
     // -- the two always concatenate back to the request path by construction
@@ -88,9 +104,17 @@ std::vector<std::string> buildEnv(const Connection& conn, const std::string& scr
     return env;
 }
 
-// Parses raw CGI output ("headers\n\nbody" or "headers\r\n\r\nbody") into a
-// status code, a Content-Type (if any), pass-through headers and the
-// body, then writes the final HTTP response.
+/**
+ * @brief Turns raw CGI stdout into the actual HTTP response.
+ *
+ * Expects "headers\n\nbody" or "headers\r\n\r\nbody" per CGI/1.1 -- pulls
+ * out a Status: line and Content-Type if the script sent them, passes
+ * through any other headers, and defaults to 200/text/html if it sent
+ * neither.
+ *
+ * @param conn Connection to write the final response into.
+ * @param raw  Everything the CGI wrote to its stdout.
+ */
 void finishFromCgiOutput(Connection& conn, const std::string& raw) {
     size_t sep = raw.find("\r\n\r\n");
     size_t sepLen = 4;
@@ -148,6 +172,23 @@ void finishFromCgiOutput(Connection& conn, const std::string& raw) {
 
 namespace cgi_handler {
 
+/**
+ * @brief Forks + execve's a CGI script and wires up its stdin/stdout pipes.
+ *
+ * Returns immediately -- never blocks on the child. On success the caller
+ * (RequestHandler) sets conn.state = CGI_RUNNING and the core loop takes
+ * it from there via onStdinWritable()/onStdoutReadable(). On failure a
+ * complete error response is written directly and conn.state is left
+ * alone (normal PROCESSING -> WRITING_RESPONSE applies).
+ *
+ * @param conn        Connection making the request (conn.body is what
+ *                     gets piped to the child's stdin, if anything).
+ * @param scriptPath  Filesystem path of the script.
+ * @param interpreter Interpreter binary to execve() (e.g. python3).
+ * @param loc         Matched location (currently unused here, kept for a
+ *                     future per-location CGI setting).
+ * @return true if the fork succeeded.
+ */
 bool start(Connection& conn, const std::string& scriptPath, const std::string& interpreter,
            const Location& loc) {
     (void)loc;
@@ -227,6 +268,15 @@ bool start(Connection& conn, const std::string& scriptPath, const std::string& i
     return true;
 }
 
+/**
+ * @brief Writes one chunk of conn.body to the CGI's stdin.
+ *
+ * Call exactly once per POLLOUT on conn.cgi_stdin_fd. Marks the fd -1
+ * (never close()s it directly -- see the note below) once the whole body
+ * has gone out, or immediately on any write error.
+ *
+ * @param conn Connection whose body is being streamed to its CGI child.
+ */
 void onStdinWritable(Connection& conn) {
     if (conn.cgi_stdin_fd == -1)
         return;
@@ -250,6 +300,12 @@ void onStdinWritable(Connection& conn) {
     }
 }
 
+/**
+ * @brief Reads one chunk of the CGI's stdout into conn.cgi_out.
+ * @param conn Connection accumulating CGI output. cgi_stdout_fd is marked
+ *             -1 on EOF or a read error (see onStdinWritable()'s note on
+ *             why it isn't close()d here).
+ */
 void onStdoutReadable(Connection& conn) {
     if (conn.cgi_stdout_fd == -1)
         return;
@@ -262,10 +318,25 @@ void onStdoutReadable(Connection& conn) {
         conn.cgi_stdout_fd = -1;
 }
 
+/** @brief True once both CGI pipes have been marked closed. */
 bool isDone(const Connection& conn) {
     return conn.cgi_stdin_fd == -1 && conn.cgi_stdout_fd == -1;
 }
 
+/**
+ * @brief Assembles the final response once both CGI pipes are closed.
+ *
+ * A single non-blocking waitpid() tells an execve() failure (exit 127, no
+ * output -> 502) apart from a script that legitimately said nothing (->
+ * 200). Since pipes closing and the child becoming reapable are two
+ * separate kernel events, the child can briefly still be un-reapable right
+ * after EOF -- in that case this changes nothing and returns false so the
+ * caller retries on a later poll() iteration instead of guessing 200.
+ *
+ * @param conn       Connection whose CGI just finished.
+ * @param pendingPid Set to a pid that still needs reapIfExited() later, or 0.
+ * @return true once conn.state has actually been set to WRITING_RESPONSE.
+ */
 bool finish(Connection& conn, pid_t& pendingPid) {
     pendingPid = 0;
     if (conn.cgi_pid == -1) {
@@ -292,6 +363,13 @@ bool finish(Connection& conn, pid_t& pendingPid) {
     return true;
 }
 
+/**
+ * @brief Kills a CGI that blew past conn.cgi_deadline and writes a 504.
+ * @param conn Connection whose CGI is being aborted. Both pipe fds are
+ *             marked -1 here (actual close() deferred to the caller's
+ *             end-of-iteration cleanup, same as the pipe I/O functions).
+ * @return A pid still needing reapIfExited(), or 0 if already reaped.
+ */
 pid_t abortTimeout(Connection& conn) {
     // Same "never close() here" reasoning as onStdinWritable()/
     // onStdoutReadable() above -- the caller (harness_main.cpp) captures
@@ -320,6 +398,7 @@ pid_t abortTimeout(Connection& conn) {
     return pending;
 }
 
+/** @brief Non-blocking opportunistic reap. @return true once `pid` is actually gone. */
 bool reapIfExited(pid_t pid) {
     int status = 0;
     return waitpid(pid, &status, WNOHANG) == pid;

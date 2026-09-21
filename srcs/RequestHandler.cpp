@@ -13,6 +13,19 @@
 
 namespace {
 
+/**
+ * @brief Joins a location's filesystem root with a request's leftover path.
+ *
+ * Alias-style, per the subject's own /kapouet example: `rel` (whatever's
+ * left of the URL after the matched location prefix) is appended straight
+ * onto `root`, not the full original URL -- so an exact-match location
+ * (empty rel) just resolves to `root` itself.
+ *
+ * @param root Location's configured root directory (or, for an exact-path
+ *             location, the exact file it should serve).
+ * @param rel  Remainder of the request path after the location prefix.
+ * @return Filesystem path to stat()/open().
+ */
 std::string joinPath(const std::string& root, const std::string& rel) {
     if (rel.empty())
         return root;
@@ -23,6 +36,11 @@ std::string joinPath(const std::string& root, const std::string& rel) {
     return root + rel;
 }
 
+/**
+ * @brief Directory-traversal guard: rejects any ".." path segment.
+ * @param rel Path relative to a location's root (never the raw URL).
+ * @return true if `rel` contains a literal ".." segment.
+ */
 bool hasDotDotSegment(const std::string& rel) {
     std::vector<std::string> segs = su::split(rel, '/');
     for (size_t i = 0; i < segs.size(); ++i) {
@@ -32,6 +50,10 @@ bool hasDotDotSegment(const std::string& rel) {
     return false;
 }
 
+/**
+ * @brief Extracts a path's extension, dot included (".py", ".html", ...).
+ * @return Empty string if there's no dot in the last path component.
+ */
 std::string extensionOf(const std::string& path) {
     size_t slash = path.find_last_of('/');
     size_t dot = path.find_last_of('.');
@@ -40,6 +62,7 @@ std::string extensionOf(const std::string& path) {
     return path.substr(dot);
 }
 
+/** @brief Returns everything after the last '/' (or the whole string if there is none). */
 std::string basenameOf(const std::string& path) {
     size_t slash = path.find_last_of('/');
     if (slash == std::string::npos)
@@ -47,14 +70,26 @@ std::string basenameOf(const std::string& path) {
     return path.substr(slash + 1);
 }
 
-// RFC 3875 (CGI/1.1) PATH_INFO: a request like /cgi-bin/script.py/extra/thing
-// names the script /cgi-bin/script.py with "/extra/thing" as extra path
-// information passed to it, not a 404. Walks `rel` one path segment at a
-// time looking for the first segment boundary that names an existing
-// regular file with a configured CGI extension; everything after it becomes
-// pathInfo. Only called as a fallback when the *whole* rel doesn't already
-// resolve to a file (see call site), so the common case (no trailing extra
-// path) never pays for this walk.
+/**
+ * @brief Finds a CGI script hiding behind trailing PATH_INFO segments.
+ *
+ * RFC 3875: a request like /cgi-bin/script.py/extra/thing names the script
+ * /cgi-bin/script.py with "/extra/thing" passed to it as extra path info,
+ * not a 404. Walks `rel` one segment at a time looking for the first
+ * boundary that's an existing regular file with a configured CGI
+ * extension; everything past it becomes pathInfo.
+ *
+ * Only called as a fallback when the whole of `rel` doesn't already
+ * resolve to a file, so the common case (no trailing extra path) never
+ * pays for the walk.
+ *
+ * @param loc          Location being matched, for its root + cgi_extensions.
+ * @param rel          Path remainder to search, one '/'-segment at a time.
+ * @param scriptFsPath Set to the resolved script's filesystem path on success.
+ * @param pathInfo     Set to whatever's left after the script (RFC 3875 PATH_INFO).
+ * @param interpreter  Set to the interpreter configured for the matched extension.
+ * @return true if a script boundary was found.
+ */
 bool resolveCgiScript(const Location& loc, const std::string& rel, std::string& scriptFsPath,
                        std::string& pathInfo, std::string& interpreter) {
     std::vector<std::string> segs = su::split(rel, '/');
@@ -82,6 +117,12 @@ bool resolveCgiScript(const Location& loc, const std::string& rel, std::string& 
     return false;
 }
 
+/**
+ * @brief Reads a regular file whole and writes it out as a 200 response.
+ * @param conn Connection to write the response into.
+ * @param path Filesystem path of the file (already known to exist).
+ * @param st   stat() result for `path`, so we don't have to call it twice.
+ */
 void serveFile(Connection& conn, const std::string& path, const struct stat& st) {
     std::ifstream file(path.c_str(), std::ios::binary);
     if (!file.is_open()) {
@@ -96,6 +137,13 @@ void serveFile(Connection& conn, const std::string& path, const struct stat& st)
     request_handler::writeResponse(conn, 200, http_status::mimeType(path), body);
 }
 
+/**
+ * @brief Builds a plain directory-listing page (autoindex on).
+ * @param conn    Connection to write the response into.
+ * @param fsDir   Filesystem directory to list.
+ * @param reqPath Original request path, used for the page title and the
+ *                "../" parent link.
+ */
 void serveAutoindex(Connection& conn, const std::string& fsDir, const std::string& reqPath) {
     DIR* dir = opendir(fsDir.c_str());
     if (dir == 0) {
@@ -128,6 +176,19 @@ void serveAutoindex(Connection& conn, const std::string& fsDir, const std::strin
 
 namespace request_handler {
 
+/**
+ * @brief Assembles a full HTTP response (status line + headers + body).
+ * @param conn        Connection to write into (conn.write_buffer, reset to
+ *                     start sending from byte 0).
+ * @param code        Status code.
+ * @param contentType MIME type, or empty to omit the header entirely
+ *                     (only valid when `body` is also empty).
+ * @param body        Response body. Silently dropped for HEAD requests
+ *                     (see comment below) but still counted in
+ *                     Content-Length.
+ * @param extraHeaders Pre-formatted extra header lines ("Name: value\r\n"
+ *                      each), appended as-is before the blank line.
+ */
 void writeResponse(Connection& conn, int code, const std::string& contentType,
                     const std::string& body, const std::string& extraHeaders) {
     std::ostringstream out;
@@ -151,6 +212,12 @@ void writeResponse(Connection& conn, int code, const std::string& contentType,
     conn.bytes_written = 0;
 }
 
+/**
+ * @brief Writes an error response, using the configured error_page for
+ *        `code` if one exists and is readable, else the built-in default.
+ * @param conn Connection to write into.
+ * @param code Status code (404, 403, 500, ...).
+ */
 void writeErrorResponse(Connection& conn, int code) {
     if (conn.server_conf) {
         std::map<int, std::string>::const_iterator it = conn.server_conf->error_pages.find(code);
@@ -169,6 +236,20 @@ void writeErrorResponse(Connection& conn, int code) {
 
 }  // namespace request_handler
 
+/**
+ * @brief Routes a fully-parsed request and writes a response into conn.
+ *
+ * Order of operations matters here: bail out on a parse error first, then
+ * match a location, apply redirects/method checks, then branch on method
+ * (DELETE / CGI / POST-upload / GET), falling through to plain static-file
+ * or directory handling for everything else. A CGI dispatch leaves
+ * conn.state as CGI_RUNNING instead of writing a response directly -- the
+ * core loop drives it the rest of the way via CgiHandler.
+ *
+ * @param conn Connection with method/path/headers/body already filled in
+ *             by try_parse_request(); conn.write_buffer (or conn.state)
+ *             is set on return.
+ */
 void handle_request(Connection& conn) {
     if (conn.status_code != 0) {
         request_handler::writeErrorResponse(conn, conn.status_code);

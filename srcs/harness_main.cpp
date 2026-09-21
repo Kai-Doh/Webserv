@@ -52,6 +52,7 @@ namespace {
 // touch from a signal handler.
 volatile sig_atomic_t g_shouldStop = 0;
 
+/** @brief SIGINT/SIGTERM handler -- just flips a flag the main loop checks each iteration. */
 void handleShutdownSignal(int) {
     g_shouldStop = 1;
 }
@@ -60,10 +61,17 @@ const size_t READ_CHUNK = 4096;
 const int CGI_POLL_TIMEOUT_MS = 1000;   // wake up periodically to sweep CGI deadlines
 const int REAP_POLL_TIMEOUT_MS = 100;   // faster catch-up while zombies are pending reap
 
+/** @brief Sets O_NONBLOCK on a socket/pipe fd. */
 void setNonBlocking(int fd) {
     fcntl(fd, F_SETFL, O_NONBLOCK);
 }
 
+/**
+ * @brief Creates, binds and listens on one non-blocking TCP socket.
+ * @param host Interface to bind ("0.0.0.0"/empty for all interfaces).
+ * @param port Port to listen on.
+ * @return The listening fd, or -1 on any failure (already logged via perror).
+ */
 int openListenSocket(const std::string& host, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -96,6 +104,11 @@ int openListenSocket(const std::string& host, int port) {
     return fd;
 }
 
+/**
+ * @brief Resets a Connection for the next request on a keep-alive socket.
+ * @param conn Connection to reset. fd/server_conf/keep_alive are left
+ *             untouched -- those belong to the connection, not the request.
+ */
 void resetForNextRequest(Connection& conn) {
     conn.method.clear();
     conn.path.clear();
@@ -115,12 +128,21 @@ void resetForNextRequest(Connection& conn) {
     conn.state = READING_REQUEST;
 }
 
-// If handle_request() just started a CGI (conn.state == CGI_RUNNING),
-// queues its pipe(s) to be added to poll_fds and records who owns them,
-// so the main loop can find the right Connection when poll() reports
-// activity on a pipe fd. Never touches poll_fds directly here (a
-// push_back could reallocate the vector while the caller may still be
-// holding a reference into it for this same iteration).
+/**
+ * @brief Queues a freshly-started CGI's pipe(s) to join poll_fds.
+ *
+ * Does nothing unless conn.state == CGI_RUNNING. Never touches poll_fds
+ * directly -- a push_back() there could reallocate the vector while the
+ * caller may still be holding a reference into it for this same iteration.
+ *
+ * @param conn             Connection that may have just started a CGI.
+ * @param clientPollEntry  This connection's own pollfd entry, so its
+ *                         events can be cleared while the CGI runs.
+ * @param fdsToAdd         Pipe fds to append to poll_fds once the caller's
+ *                         current pass over it is done.
+ * @param cgiOwner         Updated so the main loop can map a pipe fd back
+ *                         to the client fd that owns it.
+ */
 void registerCgiFdsIfStarted(Connection& conn, struct pollfd& clientPollEntry,
                               std::vector<struct pollfd>& fdsToAdd, std::map<int, int>& cgiOwner) {
     if (conn.state != CGI_RUNNING)
@@ -145,14 +167,23 @@ void registerCgiFdsIfStarted(Connection& conn, struct pollfd& clientPollEntry,
     }
 }
 
-// Tries to parse and immediately handle a request from whatever is
-// already sitting in conn.read_buffer, with NO socket I/O of its own
-// (try_parse_request/handle_request only touch in-memory buffers, except
-// for handle_request() possibly forking a CGI -- fork()/pipe() are not
-// read()/write() on an existing fd, so that's not a poll() violation
-// either). This is what lets pipelined/keep-alive requests that arrived
-// in the same read() as a previous one get processed without waiting for
-// a POLLIN event that may never come.
+/**
+ * @brief Parses + handles whatever request is already sitting in the
+ *        read buffer, with no socket I/O of its own.
+ *
+ * try_parse_request()/handle_request() only touch in-memory buffers
+ * (handle_request() possibly forking a CGI doesn't count -- fork()/pipe()
+ * aren't read()/write() on an existing fd, so that's not a poll()
+ * violation). This is what lets a pipelined keep-alive request that
+ * arrived in the same read() as the previous one get processed right
+ * away, instead of waiting on a POLLIN event that may never come.
+ *
+ * @param conn      Connection to pump.
+ * @param pfd       This connection's pollfd entry, updated for whatever
+ *                  comes next (POLLOUT once a response is ready).
+ * @param fdsToAdd  Passed through to registerCgiFdsIfStarted().
+ * @param cgiOwner  Passed through to registerCgiFdsIfStarted().
+ */
 void pump(Connection& conn, struct pollfd& pfd, std::vector<struct pollfd>& fdsToAdd,
           std::map<int, int>& cgiOwner) {
     if (conn.state != READING_REQUEST || !try_parse_request(conn))
@@ -167,6 +198,7 @@ void pump(Connection& conn, struct pollfd& pfd, std::vector<struct pollfd>& fdsT
     }
 }
 
+/** @brief Finds `fd` in poll_fds and updates its events mask. No-op if not found. */
 void findAndSetEvents(std::vector<struct pollfd>& poll_fds, int fd, short events) {
     for (size_t k = 0; k < poll_fds.size(); ++k) {
         if (poll_fds[k].fd == fd) {
@@ -178,6 +210,14 @@ void findAndSetEvents(std::vector<struct pollfd>& poll_fds, int fd, short events
 
 }  // namespace
 
+/**
+ * @brief Entry point: loads the config, opens the listen sockets, then
+ *        runs the single-poll() event loop until SIGINT/SIGTERM.
+ * @param argc/argv Optional config file path (falls back to
+ *                  conf/default.conf if omitted).
+ * @return 0 on a clean shutdown, 1 on a startup failure (bad args, socket
+ *         setup, or a malformed config).
+ */
 int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGINT, handleShutdownSignal);

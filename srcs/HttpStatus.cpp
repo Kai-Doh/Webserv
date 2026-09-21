@@ -3,6 +3,7 @@
 
 namespace http_status {
 
+/** @brief Standard reason phrase for a status code, "Unknown" if we don't recognize it. */
 std::string reasonPhrase(int code) {
     switch (code) {
         case 200: return "OK";
@@ -31,6 +32,7 @@ std::string reasonPhrase(int code) {
     }
 }
 
+/** @brief Minimal built-in HTML error page, used when no error_page is configured for `code`. */
 std::string defaultErrorBody(int code) {
     std::string reason = reasonPhrase(code);
     std::string codeStr = su::toString(static_cast<long>(code));
@@ -43,6 +45,7 @@ std::string defaultErrorBody(int code) {
     return body;
 }
 
+/** @brief Guesses a Content-Type from a file's extension. Falls back to application/octet-stream. */
 std::string mimeType(const std::string& path) {
     size_t dot = path.find_last_of('.');
     if (dot == std::string::npos)
