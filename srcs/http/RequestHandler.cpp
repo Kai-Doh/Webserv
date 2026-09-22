@@ -350,11 +350,9 @@ void handle_request(Connection& conn) {
             // fsPath's own extension is CGI-mapped even though nothing
             // exists there -- dispatch anyway rather than 404ing. Matches
             // both a front-controller-style interpreter (common in real
-            // deployments) and, concretely, the official cgi_tester
-            // binary, which never touches the filesystem at all and is
-            // meant to answer for *any* .bla-suffixed path (verified live:
-            // the tester itself POSTs to a deliberately nonexistent .bla
-            // path and expects a real response, not a 404).
+            // deployments) and the official cgi_tester binary, which
+            // never touches the filesystem and answers for any
+            // .bla-suffixed path regardless of whether it exists.
             cgiScriptFsPath = fsPath;
             cgiInterpreter = directIt->second;
             isCgi = true;
@@ -450,8 +448,7 @@ void handle_request(Connection& conn) {
             return;
         }
         // 404, not 403: from the client's perspective there's simply no
-        // resource at this URL (matches the official 42 tester's own
-        // expectation -- verified live against it).
+        // resource at this URL.
         request_handler::writeErrorResponse(conn, 404);
         return;
     }

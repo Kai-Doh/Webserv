@@ -97,39 +97,24 @@ struct Connection {
     // request currently being read have already been parsed into
     // method/path/headers/etc below. try_parse_request() is called again
     // from scratch on every partial read() while a large body is still
-    // arriving (there's no other hook for "more bytes arrived") -- without
-    // this, it would re-parse the same fixed header section from zero on
-    // every single one of those calls. Harmless for one request in
-    // isolation, but multiplied by ~4KB-chunk reads across a large body
-    // *and* many concurrent connections, that redundant work becomes the
-    // dominant cost: a live stress-test run (20 concurrent 100MB CGI
-    // POSTs) pegged one CPU core for 9+ minutes with zero forward
-    // progress until this flag was added to skip it.
+    // arriving -- without this, it would re-parse the same fixed header
+    // section on every call, which only matters once multiplied across a
+    // large body and many concurrent connections.
     bool headers_ready;
 
     // ADDED (HTTP side): offset into read_buffer where the body begins,
-    // computed once (right when headers_ready is set) and reused on every
-    // later call instead of being re-derived. It looks harmless to re-run
-    // that derivation each time -- it's just two string searches for a
-    // separator that sits at a small, fixed, early offset -- but one of
-    // those two searches (the bare "\n\n" telnet fallback) has no reason
-    // to resolve early: it's an unrelated 2-byte pattern that a large
-    // binary/chunked body may never happen to contain, so it scans to the
-    // end of read_buffer looking for it, every single call. That single
-    // wrong assumption cost 9+ minutes in a live stress-test run before
-    // being found by timing every step of try_parse_request() directly.
+    // computed once (when headers_ready is set) and reused on every later
+    // call instead of being re-derived via findHeaderEnd(), which also
+    // searches for a bare "\n\n" telnet fallback that has no reason to
+    // resolve early in a large binary/chunked body and can scan to the
+    // end of read_buffer.
     size_t body_start;
 
     // ADDED (HTTP side): resume point, in bytes past the start of the
-    // request body, for incremental Transfer-Encoding: chunked decoding.
-    // try_parse_request() is called again from scratch on every partial
-    // read() (there is no other hook for "more bytes arrived"), and a
-    // chunked body can arrive across thousands of small reads -- without
-    // remembering how far decoding already got, each call would re-scan
-    // and re-copy everything received so far, making one request's total
-    // parsing cost O(body size squared) instead of O(body size). Decoded
-    // payload accumulates directly in `body` as each complete chunk is
-    // confirmed, so resuming here never redoes completed work.
+    // request body, for incremental Transfer-Encoding: chunked decoding --
+    // without it, each call would re-scan and re-copy the whole body
+    // received so far. Decoded payload accumulates directly in `body` as
+    // each chunk is confirmed.
     size_t chunked_scan_pos;
 
     Connection()

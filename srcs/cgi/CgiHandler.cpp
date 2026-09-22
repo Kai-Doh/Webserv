@@ -65,12 +65,10 @@ std::vector<std::string> buildEnv(const Connection& conn, const std::string& scr
 
     // The official 42 cgi_tester binary (subject-provided) checks PATH_INFO
     // against the *full* request path when the script itself is the exact
-    // request target, not empty as RFC 3875 would have it -- confirmed by
-    // running cgi_tester directly with controlled env vars until "PATH_INFO
-    // incorrect"/"not found" stopped firing. Only fall back to that when
-    // there's genuinely no RFC-3875 extra-path component, so a real
-    // PATH_INFO-walking request (e.g. /cgi-bin/script.py/extra/thing) still
-    // gets the standards-correct trailing segment.
+    // request target, not empty as RFC 3875 would have it. Only fall back
+    // to that when there's genuinely no RFC-3875 extra-path component, so
+    // a real PATH_INFO-walking request (e.g. /cgi-bin/script.py/extra/thing)
+    // still gets the standards-correct trailing segment.
     std::string pathInfoEnv = conn.cgi_path_info.empty() ? conn.path : conn.cgi_path_info;
 
     std::vector<std::string> env;
