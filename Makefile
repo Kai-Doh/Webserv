@@ -6,12 +6,15 @@
 NAME        = webserv
 
 CXX         = c++
-CXXFLAGS    = -Wall -Wextra -Werror -std=c++98 -Iinclude -MMD -MP
+CXXFLAGS    = -Wall -Wextra -Werror -std=c++98 -Iinclude -Isrcs -MMD -MP
 
 SRCS_DIR    = srcs
 OBJS_DIR    = objs
 
-SRCS        = $(wildcard $(SRCS_DIR)/*.cpp)
+# Recursive: srcs/ is organized into subfolders by module (http/, cgi/,
+# config/, utils/, core/, net/, ...), so a flat wildcard would silently
+# drop files.
+SRCS        = $(shell find $(SRCS_DIR) -name '*.cpp')
 OBJS        = $(patsubst $(SRCS_DIR)/%.cpp,$(OBJS_DIR)/%.o,$(SRCS))
 DEPS        = $(OBJS:.o=.d)
 
@@ -20,11 +23,9 @@ all: $(NAME)
 $(NAME): $(OBJS)
 	$(CXX) $(CXXFLAGS) $(OBJS) -o $(NAME)
 
-$(OBJS_DIR)/%.o: $(SRCS_DIR)/%.cpp | $(OBJS_DIR)
+$(OBJS_DIR)/%.o: $(SRCS_DIR)/%.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-$(OBJS_DIR):
-	mkdir -p $(OBJS_DIR)
 
 -include $(DEPS)
 

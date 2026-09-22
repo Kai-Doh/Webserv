@@ -1,10 +1,11 @@
 #include "Config.hpp"
-#include "StringUtils.hpp"
+#include "utils/StringUtils.hpp"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <cctype>
 
+/** @brief Checks `method` against this location's configured `methods` list. */
 bool Location::methodAllowed(const std::string& method) const {
     for (size_t i = 0; i < methods.size(); ++i) {
         if (methods[i] == method)
@@ -13,6 +14,12 @@ bool Location::methodAllowed(const std::string& method) const {
     return false;
 }
 
+/**
+ * @brief Longest-prefix location match, nginx style.
+ * @param reqPath Request path to match (already slash-collapsed).
+ * @return The best-matching Location, or 0 if nothing matches (only
+ *         possible if the config has no "/" catch-all).
+ */
 const Location* ServerConfig::matchLocation(const std::string& reqPath) const {
     const Location* best = 0;
     size_t bestLen = 0;
@@ -47,8 +54,15 @@ const Location* ServerConfig::matchLocation(const std::string& reqPath) const {
 
 namespace {
 
-// Tokenizer: '{' and '}' are standalone tokens, everything else is
-// whitespace-separated. '#' starts a line comment.
+/**
+ * @brief Splits raw config text into tokens.
+ *
+ * '{' and '}' are always their own token, everything else is whitespace-
+ * separated, and '#' starts a line comment.
+ *
+ * @param text Whole config file contents.
+ * @return Flat token stream for parseServer()/parseLocation() to walk.
+ */
 std::vector<std::string> tokenize(const std::string& text) {
     std::vector<std::string> tokens;
     std::string cur;
@@ -84,6 +98,13 @@ std::vector<std::string> tokenize(const std::string& text) {
     return tokens;
 }
 
+/**
+ * @brief Parses one "location <path> { ... }" block.
+ * @param tok Full token stream.
+ * @param i   Index of the location's path token on entry; advanced past
+ *            the block's closing "}" on return.
+ * @param loc Filled in with whatever directives were found.
+ */
 void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc) {
     // tok[i] is the location path, tok[i+1] must be "{"
     loc.path = tok[i++];
@@ -133,6 +154,13 @@ void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc
     ++i;  // consume "}"
 }
 
+/**
+ * @brief Parses one "server { ... }" block.
+ * @param tok Full token stream.
+ * @param i   Index of the block's opening "{" on entry; advanced past the
+ *            closing "}" on return.
+ * @param srv Filled in with whatever directives/locations were found.
+ */
 void parseServer(const std::vector<std::string>& tok, size_t& i, ServerConfig& srv) {
     // tok[i] is "{"
     ++i;
@@ -182,6 +210,13 @@ void parseServer(const std::vector<std::string>& tok, size_t& i, ServerConfig& s
 
 }  // namespace
 
+/**
+ * @brief Loads and parses a webserv config file.
+ * @param path Path to the config file.
+ * @return One ServerConfig per top-level "server{}" block.
+ * @throws std::runtime_error on any malformed input, so a bad config
+ *         file fails startup instead of crashing later.
+ */
 std::vector<ServerConfig> Config::load(const std::string& path) {
     std::ifstream file(path.c_str());
     if (!file.is_open())

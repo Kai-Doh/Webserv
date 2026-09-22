@@ -5,6 +5,7 @@
 
 namespace su {
 
+/** @brief Strips leading/trailing whitespace. */
 std::string trim(const std::string& s) {
     size_t start = 0;
     size_t end = s.size();
@@ -15,6 +16,7 @@ std::string trim(const std::string& s) {
     return s.substr(start, end - start);
 }
 
+/** @brief Lowercases a copy of `s`. Used for case-insensitive header names/values. */
 std::string toLower(const std::string& s) {
     std::string out(s);
     for (size_t i = 0; i < out.size(); ++i)
@@ -22,6 +24,7 @@ std::string toLower(const std::string& s) {
     return out;
 }
 
+/** @brief Uppercases a copy of `s`. Used for building CGI HTTP_* env var names. */
 std::string toUpper(const std::string& s) {
     std::string out(s);
     for (size_t i = 0; i < out.size(); ++i)
@@ -29,6 +32,10 @@ std::string toUpper(const std::string& s) {
     return out;
 }
 
+/**
+ * @brief Splits on `delim`, dropping empty fields.
+ * @return e.g. split("a//b", '/') -> {"a", "b"}, not {"a", "", "b"}.
+ */
 std::vector<std::string> split(const std::string& s, char delim) {
     std::vector<std::string> out;
     std::string cur;
@@ -47,24 +54,32 @@ std::vector<std::string> split(const std::string& s, char delim) {
     return out;
 }
 
+/** @brief True if `s` begins with `prefix`. */
 bool startsWith(const std::string& s, const std::string& prefix) {
     if (prefix.size() > s.size())
         return false;
     return s.compare(0, prefix.size(), prefix) == 0;
 }
 
+/** @brief long -> std::string (no std::to_string in C++98). */
 std::string toString(long value) {
     std::ostringstream oss;
     oss << value;
     return oss.str();
 }
 
+/** @brief size_t -> std::string (no std::to_string in C++98). */
 std::string toString(size_t value) {
     std::ostringstream oss;
     oss << value;
     return oss.str();
 }
 
+/**
+ * @brief Strict string-to-long: digits (and a leading '-') only, no
+ *        trailing garbage, unlike a bare strtol() call.
+ * @param ok Set to false on anything that isn't a clean integer.
+ */
 long toLong(const std::string& s, bool& ok) {
     if (s.empty()) {
         ok = false;
@@ -82,6 +97,7 @@ long toLong(const std::string& s, bool& ok) {
     return value;
 }
 
+/** @brief Decodes %XX escapes and '+' (as a space), application/x-www-form-urlencoded style. */
 std::string urlDecode(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -102,6 +118,7 @@ std::string urlDecode(const std::string& s) {
     return out;
 }
 
+/** @brief "content-type" -> "HTTP_CONTENT_TYPE", CGI/1.1's header-to-env-var convention. */
 std::string headerKeyToEnv(const std::string& key) {
     std::string out = "HTTP_";
     for (size_t i = 0; i < key.size(); ++i) {

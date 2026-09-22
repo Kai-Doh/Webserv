@@ -1,6 +1,6 @@
 #include "connection.hpp"
 #include "RequestParser.hpp"
-#include "StringUtils.hpp"
+#include "utils/StringUtils.hpp"
 #include <cstdlib>
 #include <cctype>
 
@@ -13,6 +13,19 @@ const size_t MAX_URI_LENGTH = 8000;
 
 namespace request_parser {
 
+/**
+ * @brief Decodes one RFC 7230 chunked body (size lines + trailer).
+ *
+ * @param data      Raw bytes starting at the first chunk-size line.
+ * @param out       Filled with the decoded payload on success.
+ * @param consumed  Filled with how many bytes of `data` were used up,
+ *                  including the terminating "0\r\n\r\n".
+ * @param malformed Set to true if the encoding itself is broken (bad hex
+ *                  size, missing CRLF, ...). Left false if we just don't
+ *                  have the full body yet.
+ * @return true once the whole chunked body has been decoded, false if more
+ *         data is needed or the encoding is malformed.
+ */
 bool decodeChunked(const std::string& data, std::string& out, size_t& consumed, bool& malformed) {
     malformed = false;
     size_t pos = 0;
@@ -76,6 +89,13 @@ bool decodeChunked(const std::string& data, std::string& out, size_t& consumed, 
 
 namespace {
 
+/**
+ * @brief Locates the header/body separator in a request buffer.
+ * @param buf       Bytes accumulated so far for this request.
+ * @param headerEnd Set to the offset where the header section ends.
+ * @param sepLen    Set to 4 for "\r\n\r\n", 2 for the telnet-friendly "\n\n".
+ * @return false if neither separator has shown up yet.
+ */
 bool findHeaderEnd(const std::string& buf, size_t& headerEnd, size_t& sepLen) {
     size_t crlf = buf.find("\r\n\r\n");
     size_t lf = buf.find("\n\n");  // telnet-friendly fallback
@@ -92,10 +112,17 @@ bool findHeaderEnd(const std::string& buf, size_t& headerEnd, size_t& sepLen) {
     return false;
 }
 
-// Collapses runs of '/' into one, the way nginx/Apache normalize request
-// paths, so "//directory" and "/directory" route to the same location
-// instead of the doubled slash silently falling through to the catch-all
-// "/" location and 404ing.
+/**
+ * @brief Collapses runs of '/' into one, nginx/Apache-style.
+ *
+ * Without this, "//directory" and "/directory" are different strings as
+ * far as location matching is concerned, so the doubled slash silently
+ * falls through to the catch-all "/" location and 404s instead of hitting
+ * the route it obviously meant.
+ *
+ * @param path Decoded request path.
+ * @return Same path with consecutive slashes merged into one.
+ */
 std::string collapseSlashes(const std::string& path) {
     std::string out;
     out.reserve(path.size());
@@ -107,6 +134,16 @@ std::string collapseSlashes(const std::string& path) {
     return out;
 }
 
+/**
+ * @brief Bails out of parsing with an error status.
+ * @param conn          Connection being parsed.
+ * @param code          Status code to report (400, 413, 414, 431, 505...).
+ * @param consumedBytes How many bytes to drop from read_buffer -- not
+ *                      always the whole thing, since a pipelined next
+ *                      request might already be sitting right after it.
+ * @param closeConn     If true, conn.keep_alive is forced off so the core
+ *                      loop closes the socket after sending the error.
+ */
 void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn) {
     conn.status_code = code;
     conn.keep_alive = !closeConn;
@@ -118,6 +155,20 @@ void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn)
 
 }  // namespace
 
+/**
+ * @brief Tries to parse one full HTTP request out of conn.read_buffer.
+ *
+ * Handles Content-Length and chunked bodies, keep-alive/pipelining (there
+ * can be leftover bytes for the *next* request once this one is consumed),
+ * and reports every parse failure through conn.status_code instead of
+ * throwing -- handle_request() is what actually turns that into a response.
+ *
+ * @param conn Connection whose read_buffer is consumed on success/failure,
+ *             and whose method/path/headers/body fields get filled in.
+ * @return true if a request (good or bad) was fully parsed and conn is
+ *         ready for handle_request(); false if read_buffer isn't a
+ *         complete request yet, so the caller should wait for more bytes.
+ */
 bool try_parse_request(Connection& conn) {
     std::string& buf = conn.read_buffer;
 
