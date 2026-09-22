@@ -124,10 +124,10 @@ bool resolveCgiScript(const Location& loc, const std::string& rel, std::string& 
  * @param path Filesystem path of the file (already known to exist).
  * @param st   stat() result for `path`, so we don't have to call it twice.
  */
-void serveFile(Connection& conn, const std::string& path, const struct stat& st) {
+void serveFile(Connection& conn, const std::string& path, const struct stat& st, const Location* loc) {
     std::ifstream file(path.c_str(), std::ios::binary);
     if (!file.is_open()) {
-        request_handler::writeErrorResponse(conn, 403);
+        request_handler::writeErrorResponse(conn, 403, loc);
         return;
     }
     std::string body;
@@ -145,10 +145,10 @@ void serveFile(Connection& conn, const std::string& path, const struct stat& st)
  * @param reqPath Original request path, used for the page title and the
  *                "../" parent link.
  */
-void serveAutoindex(Connection& conn, const std::string& fsDir, const std::string& reqPath) {
+void serveAutoindex(Connection& conn, const std::string& fsDir, const std::string& reqPath, const Location* loc) {
     DIR* dir = opendir(fsDir.c_str());
     if (dir == 0) {
-        request_handler::writeErrorResponse(conn, 403);
+        request_handler::writeErrorResponse(conn, 403, loc);
         return;
     }
     std::string body = "<!DOCTYPE html>\n<html><head><title>Index of " + reqPath +
@@ -173,6 +173,29 @@ void serveAutoindex(Connection& conn, const std::string& fsDir, const std::strin
     request_handler::writeResponse(conn, 200, "text/html", body);
 }
 
+/**
+ * @brief Formats the current time as an RFC 7231 IMF-fixdate, for the
+ *        response's Date header (e.g. "Sun, 06 Nov 1994 08:49:37 GMT").
+ */
+std::string httpDate(void) {
+    time_t now = std::time(0);
+    struct tm* tmVal = std::gmtime(&now);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", tmVal);
+    return std::string(buf);
+}
+
+/**
+ * @brief Whether `method` is a method this server recognizes at all, as
+ *        opposed to one that's simply not allowed on the matched location.
+ *        Drives the 501 vs. 405 split in handle_request().
+ */
+bool isKnownMethod(const std::string& method) {
+    return method == "GET" || method == "POST" || method == "DELETE" ||
+           method == "HEAD" || method == "PUT" || method == "OPTIONS" ||
+           method == "PATCH";
+}
+
 }
 
 namespace request_handler {
@@ -195,6 +218,7 @@ void writeResponse(Connection& conn, int code, const std::string& contentType,
     std::ostringstream out;
     std::string version = conn.http_version.empty() ? "HTTP/1.1" : conn.http_version;
     out << version << " " << code << " " << http_status::reasonPhrase(code) << "\r\n";
+    out << "Date: " << httpDate() << "\r\n";
     out << "Server: webserv/1.0\r\n";
     out << "Connection: " << (conn.keep_alive ? "keep-alive" : "close") << "\r\n";
     if (!contentType.empty())
@@ -211,10 +235,25 @@ void writeResponse(Connection& conn, int code, const std::string& contentType,
 /**
  * @brief Writes an error response, using the configured error_page for
  *        `code` if one exists and is readable, else the built-in default.
+ *        A location-specific error_page (`loc`) takes priority over the
+ *        server-level one; either can be absent.
  * @param conn Connection to write into.
  * @param code Status code (404, 403, 500, ...).
+ * @param loc  Matched location, if one was resolved yet (0 otherwise).
  */
-void writeErrorResponse(Connection& conn, int code) {
+void writeErrorResponse(Connection& conn, int code, const Location* loc) {
+    if (loc) {
+        std::map<int, std::string>::const_iterator it = loc->error_pages.find(code);
+        if (it != loc->error_pages.end()) {
+            std::ifstream file(it->second.c_str(), std::ios::binary);
+            if (file.is_open()) {
+                std::ostringstream buf;
+                buf << file.rdbuf();
+                writeResponse(conn, code, http_status::mimeType(it->second), buf.str());
+                return;
+            }
+        }
+    }
     if (conn.server_conf) {
         std::map<int, std::string>::const_iterator it = conn.server_conf->error_pages.find(code);
         if (it != conn.server_conf->error_pages.end()) {
@@ -272,6 +311,11 @@ void handle_request(Connection& conn) {
     }
 
     if (!loc->methodAllowed(conn.method)) {
+        if (!isKnownMethod(conn.method)) {
+            conn.status_code = 501;
+            request_handler::writeErrorResponse(conn, 501, loc);
+            return;
+        }
         std::string allow;
         for (size_t i = 0; i < loc->methods.size(); ++i) {
             allow += loc->methods[i];
@@ -285,7 +329,7 @@ void handle_request(Connection& conn) {
     }
 
     if (loc->root.empty()) {
-        request_handler::writeErrorResponse(conn, 500);
+        request_handler::writeErrorResponse(conn, 500, loc);
         return;
     }
 
@@ -294,7 +338,7 @@ void handle_request(Connection& conn) {
                            : "";
     if (hasDotDotSegment(rel)) {
         conn.status_code = 403;
-        request_handler::writeErrorResponse(conn, 403);
+        request_handler::writeErrorResponse(conn, 403, loc);
         return;
     }
     std::string fsPath = joinPath(loc->root, rel);
@@ -304,15 +348,15 @@ void handle_request(Connection& conn) {
 
     if (conn.method == "DELETE") {
         if (!exists) {
-            request_handler::writeErrorResponse(conn, 404);
+            request_handler::writeErrorResponse(conn, 404, loc);
             return;
         }
         if (S_ISDIR(st.st_mode)) {
-            request_handler::writeErrorResponse(conn, 403);
+            request_handler::writeErrorResponse(conn, 403, loc);
             return;
         }
         if (std::remove(fsPath.c_str()) != 0) {
-            request_handler::writeErrorResponse(conn, 403);
+            request_handler::writeErrorResponse(conn, 403, loc);
             return;
         }
         conn.status_code = 204;
@@ -349,7 +393,7 @@ void handle_request(Connection& conn) {
 
     if (isCgi) {
         if (cgiTargetMustExist && access(cgiScriptFsPath.c_str(), R_OK) != 0) {
-            request_handler::writeErrorResponse(conn, 403);
+            request_handler::writeErrorResponse(conn, 403, loc);
             return;
         }
         conn.cgi_path_info = cgiPathInfo;
@@ -373,7 +417,7 @@ void handle_request(Connection& conn) {
         std::string dest = joinPath(loc->upload_store, filename);
         std::ofstream out(dest.c_str(), std::ios::binary | std::ios::trunc);
         if (!out.is_open()) {
-            request_handler::writeErrorResponse(conn, 500);
+            request_handler::writeErrorResponse(conn, 500, loc);
             return;
         }
         if (!conn.body.empty())
@@ -386,7 +430,7 @@ void handle_request(Connection& conn) {
     }
 
     if (!exists) {
-        request_handler::writeErrorResponse(conn, 404);
+        request_handler::writeErrorResponse(conn, 404, loc);
         return;
     }
 
@@ -404,17 +448,17 @@ void handle_request(Connection& conn) {
             std::string idx = joinPath(fsPath, loc->index);
             struct stat ist;
             if (stat(idx.c_str(), &ist) == 0 && S_ISREG(ist.st_mode)) {
-                serveFile(conn, idx, ist);
+                serveFile(conn, idx, ist, loc);
                 return;
             }
         }
         if (loc->autoindex) {
-            serveAutoindex(conn, fsPath, conn.path);
+            serveAutoindex(conn, fsPath, conn.path, loc);
             return;
         }
-        request_handler::writeErrorResponse(conn, 404);
+        request_handler::writeErrorResponse(conn, 404, loc);
         return;
     }
 
-    serveFile(conn, fsPath, st);
+    serveFile(conn, fsPath, st, loc);
 }

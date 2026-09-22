@@ -17,6 +17,7 @@ struct Location {
     bool upload_enabled;
     std::string upload_store;
     std::map<std::string, std::string> cgi_extensions;
+    std::map<int, std::string> error_pages;
 
     size_t client_max_body_size;
     static const size_t NO_BODY_SIZE_OVERRIDE = static_cast<size_t>(-1);
