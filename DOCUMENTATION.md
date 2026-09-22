@@ -1457,3 +1457,167 @@ Beyond ordinary `curl`, this module's behavior has been checked against:
   header to different `server{}` blocks sharing one port) is explicitly
   optional per the subject and isn't implemented; everything the subject
   actually requires is.
+
+---
+
+# Appendix E — A real example: opening the site in a browser
+
+Chapter 8 traced one CGI request end to end. This is the everyday case
+instead: what actually happens, request by request, when someone types
+`http://localhost:8080/` into a browser's address bar and hits Enter —
+using this project's own real `www/index.html` and `conf/test.conf`, with
+real file sizes, not made-up numbers.
+
+## E.1 — Request #1: the page itself
+
+The browser opens a TCP connection to `127.0.0.1:8080` (William's side —
+out of scope here, but it's what makes the next line possible) and sends:
+
+```
+GET / HTTP/1.1
+Host: localhost
+User-Agent: Mozilla/5.0 ...
+Accept: text/html,application/xhtml+xml,...
+Connection: keep-alive
+
+```
+
+Following this module's code exactly:
+
+1. **`try_parse_request()`** (Chapter 2) finds `\r\n\r\n`, splits the
+   request line (`GET`, `/`, `HTTP/1.1`), parses the headers. `Host` is
+   present, version is `HTTP/1.1`, no `Content-Length`/`Transfer-Encoding`
+   — this is a bodiless `GET`. Returns `true` immediately; nothing to wait
+   on.
+2. **`handle_request()`** (Chapter 3): `matchLocation("/")` against
+   `conf/test.conf`'s `location / { root www; index index.html; methods
+   GET; }` — the only candidate, so it wins by default. No `return`
+   directive, `GET` is allowed, `rel` (path remainder) is empty, so
+   `joinPath("www", "")` resolves to `www` itself (Chapter 3.2's alias
+   rule: an empty remainder means "the root itself").
+3. **Chapter 4.3's `GET` branch**: `www` is a directory, the URL *does*
+   end in `/`, and `index index.html` is configured — `www/index.html`
+   exists and is a regular file, so `serveFile()` serves *that*, not a
+   listing.
+4. **`writeResponse()`** (Chapter 5.1) assembles the reply, real numbers
+   from this repository's own `www/index.html` (5394 bytes, last touched
+   2026-09-22 14:36:43 UTC):
+
+```
+HTTP/1.1 200 OK
+Date: Tue, 22 Sep 2026 15:02:11 GMT
+Server: webserv/1.0
+Connection: keep-alive
+Content-Type: text/html
+Content-Length: 5394
+Last-Modified: Tue, 22 Sep 2026 14:36:43 GMT
+
+<!DOCTYPE html>
+<html lang="en">
+...
+  <link rel="stylesheet" href="/styles.css">
+...
+</html>
+```
+
+(`Date` is *now* — generated fresh on every response, per §5.1;
+`Last-Modified` is the file's own `stat()` mtime, and stays fixed until
+`index.html` is actually edited.)
+
+## E.2 — The browser reads the HTML, and asks for more
+
+The browser doesn't stop at one request. Parsing the HTML it just
+received, it finds `<link rel="stylesheet" href="/styles.css">` — a
+resource it needs before it can even finish rendering the page — and,
+separately, every browser also automatically probes `/favicon.ico`
+whether or not the page ever mentions one. Two more requests, neither
+initiated by a person clicking anything.
+
+**Because the first response said `Connection: keep-alive`, the browser
+doesn't open a new TCP connection for these** — it reuses the exact same
+socket. On this module's side, that's the keep-alive path from Chapter
+8 §17: once `writeResponse()`'s bytes finish going out, the connection
+resets its per-request state (`headers_ready`, `body_start`,
+`chunked_scan_pos` all go back to their defaults) and waits, on the *same*
+`fd`, for whatever the browser sends next. From this module's point of
+view, request #2 below is indistinguishable from a request on a
+brand-new connection — `try_parse_request()`/`handle_request()` have no
+notion of "this is the second request on this socket" at all.
+
+## E.3 — Request #2: `GET /styles.css`
+
+```
+GET /styles.css HTTP/1.1
+Host: localhost
+Connection: keep-alive
+
+```
+
+Same two functions, same location (`/styles.css` still only matches the
+catch-all `location /`, since there's no more specific location for it),
+different file:
+
+```
+HTTP/1.1 200 OK
+Date: Tue, 22 Sep 2026 15:02:11 GMT
+Server: webserv/1.0
+Connection: keep-alive
+Content-Type: text/css
+Content-Length: 5180
+Last-Modified: Tue, 22 Sep 2026 14:36:43 GMT
+
+body { ... }
+...
+```
+
+`Content-Type: text/css` comes from `HttpStatus::mimeType()`'s
+extension table (Chapter 4.3) recognizing `.css` — nothing CSS-specific
+had to be written anywhere in the request-handling code itself.
+
+## E.4 — Request #3: `GET /favicon.ico` — and a real 404
+
+```
+GET /favicon.ico HTTP/1.1
+Host: localhost
+Connection: keep-alive
+
+```
+
+`matchLocation("/favicon.ico")` still lands on `location /` (its `root`
+is `www`, and there's no `www/favicon.ico` in this project). `handle_request()`
+reaches the `!exists` check in Chapter 4.3 and calls `writeErrorResponse()`
+(Chapter 5.2) — which finds `conf/test.conf`'s server-level
+`error_page 404 www/errors/404.html` and serves *that* instead of the
+generic built-in page:
+
+```
+HTTP/1.1 404 Not Found
+Date: Tue, 22 Sep 2026 15:02:11 GMT
+Server: webserv/1.0
+Connection: keep-alive
+Content-Type: text/html
+Content-Length: 162
+
+<!DOCTYPE html>
+...a small custom "not found" page...
+```
+
+Notice there's no `Last-Modified` here — `writeErrorResponse()` calls
+`writeResponse()` without that extra header (only `serveFile()`, in the
+success path, ever adds it), which is a real, deliberate asymmetry: a
+custom error page doesn't have one obvious "last changed" moment tied to
+*this specific response* the way a requested file does.
+
+## E.5 — Stepping back
+
+Three requests, one TCP connection, zero new code paths invented for any
+of them: every single one went through exactly `try_parse_request()` →
+`handle_request()` → `writeResponse()`/`writeErrorResponse()`, the same
+four functions Chapters 2 through 5 already fully explain. The only thing
+that changed between them was which branch of `handle_request()`'s
+decision tree (§3.3) each request's path happened to fall into — a
+successful static file, another successful static file with a different
+MIME type, and a location match with nothing at the resolved path. A
+"page load" isn't a special case this code has to know about; it's just
+several ordinary, independent requests that happen to arrive close
+together on a connection that stayed open between them.
