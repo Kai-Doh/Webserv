@@ -107,6 +107,19 @@ struct Connection {
     // progress until this flag was added to skip it.
     bool headers_ready;
 
+    // ADDED (HTTP side): offset into read_buffer where the body begins,
+    // computed once (right when headers_ready is set) and reused on every
+    // later call instead of being re-derived. It looks harmless to re-run
+    // that derivation each time -- it's just two string searches for a
+    // separator that sits at a small, fixed, early offset -- but one of
+    // those two searches (the bare "\n\n" telnet fallback) has no reason
+    // to resolve early: it's an unrelated 2-byte pattern that a large
+    // binary/chunked body may never happen to contain, so it scans to the
+    // end of read_buffer looking for it, every single call. That single
+    // wrong assumption cost 9+ minutes in a live stress-test run before
+    // being found by timing every step of try_parse_request() directly.
+    size_t body_start;
+
     // ADDED (HTTP side): resume point, in bytes past the start of the
     // request body, for incremental Transfer-Encoding: chunked decoding.
     // try_parse_request() is called again from scratch on every partial
@@ -123,7 +136,7 @@ struct Connection {
         : fd(-1), state(READING_REQUEST), bytes_written(0), keep_alive(true),
           last_activity(0), server_conf(0), cgi_stdin_fd(-1), cgi_stdout_fd(-1),
           cgi_pid(-1), status_code(0), cgi_in_offset(0), cgi_deadline(0),
-          headers_ready(false), chunked_scan_pos(0) {}
+          headers_ready(false), body_start(0), chunked_scan_pos(0) {}
 };
 
 // These two functions are the entire HTTP + CGI contract with the core

@@ -291,24 +291,28 @@ bool try_parse_request(Connection& conn) {
         // request (there can be thousands while a large body streams in)
         // takes the `if (!conn.headers_ready)` branch above and skips
         // straight past it, reading these back out of conn instead.
+        //
+        // body_start is cached rather than re-derived via findHeaderEnd()
+        // on every call: that looks cheap (the "\r\n\r\n" separator sits at
+        // a small, fixed, early offset) but findHeaderEnd() *also*
+        // unconditionally searches for a bare "\n\n" telnet fallback, an
+        // unrelated 2-byte pattern nothing guarantees resolves early --
+        // for a large binary/chunked body that never happens to contain
+        // one, that search runs to the end of read_buffer every single
+        // call. Measured live: 9+ minutes of a stress-test run spent
+        // almost entirely in that one call before this was found by
+        // timing every step of this function directly.
         conn.method = method;
         conn.path = collapseSlashes(su::urlDecode(rawPath));
         conn.query_string = queryString;
         conn.http_version = version;
         conn.headers = headers;
         conn.keep_alive = keepAlive;
+        conn.body_start = bodyStart;
         conn.headers_ready = true;
     }
 
-    // Cheap to redo every call: the separator sits right after the small,
-    // fixed header section regardless of how much body trails it, and
-    // read_buffer is never truncated before the whole request is consumed
-    // -- so this stays valid across every call for this request. Guaranteed
-    // to succeed: conn.headers_ready true means it already did once.
-    size_t headerEnd = 0;
-    size_t sepLen = 0;
-    findHeaderEnd(buf, headerEnd, sepLen);
-    size_t bodyStart = headerEnd + sepLen;
+    size_t bodyStart = conn.body_start;
 
     size_t maxBody = conn.server_conf ? conn.server_conf->client_max_body_size
                                        : static_cast<size_t>(-1);
