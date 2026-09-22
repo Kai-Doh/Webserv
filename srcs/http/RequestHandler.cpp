@@ -15,6 +15,22 @@
 namespace {
 
 /**
+ * @brief Formats a time as an RFC 7231 IMF-fixdate (e.g. "Sun, 06 Nov 1994
+ *        08:49:37 GMT"), for the Date and Last-Modified headers.
+ */
+std::string formatHttpDate(time_t t) {
+    struct tm* tmVal = std::gmtime(&t);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", tmVal);
+    return std::string(buf);
+}
+
+/** @brief Formats the current time; see formatHttpDate(). */
+std::string httpDate(void) {
+    return formatHttpDate(std::time(0));
+}
+
+/**
  * @brief Joins a location's filesystem root with a request's leftover path.
  *
  * Alias-style, per the subject's own /kapouet example: `rel` (whatever's
@@ -135,7 +151,8 @@ void serveFile(Connection& conn, const std::string& path, const struct stat& st,
     if (st.st_size > 0)
         file.read(&body[0], st.st_size);
     conn.status_code = 200;
-    request_handler::writeResponse(conn, 200, http_status::mimeType(path), body);
+    request_handler::writeResponse(conn, 200, http_status::mimeType(path), body,
+                                    "Last-Modified: " + formatHttpDate(st.st_mtime) + "\r\n");
 }
 
 /**
@@ -171,18 +188,6 @@ void serveAutoindex(Connection& conn, const std::string& fsDir, const std::strin
     body += "</ul>\n<hr><p>webserv</p>\n</body></html>\n";
     conn.status_code = 200;
     request_handler::writeResponse(conn, 200, "text/html", body);
-}
-
-/**
- * @brief Formats the current time as an RFC 7231 IMF-fixdate, for the
- *        response's Date header (e.g. "Sun, 06 Nov 1994 08:49:37 GMT").
- */
-std::string httpDate(void) {
-    time_t now = std::time(0);
-    struct tm* tmVal = std::gmtime(&now);
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", tmVal);
-    return std::string(buf);
 }
 
 /**
