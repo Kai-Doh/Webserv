@@ -1,3 +1,5 @@
+*This project has been created as part of the 42 curriculum by ktiomico, wcapt.*
+
 # Webserv — HTTP + CGI module
 
 This covers **one person's part** of the 42 `Webserv` project (see
