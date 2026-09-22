@@ -93,10 +93,23 @@ struct Connection {
     size_t cgi_in_offset;
     time_t cgi_deadline;
 
+    // ADDED (HTTP side): resume point, in bytes past the start of the
+    // request body, for incremental Transfer-Encoding: chunked decoding.
+    // try_parse_request() is called again from scratch on every partial
+    // read() (there is no other hook for "more bytes arrived"), and a
+    // chunked body can arrive across thousands of small reads -- without
+    // remembering how far decoding already got, each call would re-scan
+    // and re-copy everything received so far, making one request's total
+    // parsing cost O(body size squared) instead of O(body size). Decoded
+    // payload accumulates directly in `body` as each complete chunk is
+    // confirmed, so resuming here never redoes completed work.
+    size_t chunked_scan_pos;
+
     Connection()
         : fd(-1), state(READING_REQUEST), bytes_written(0), keep_alive(true),
           last_activity(0), server_conf(0), cgi_stdin_fd(-1), cgi_stdout_fd(-1),
-          cgi_pid(-1), status_code(0), cgi_in_offset(0), cgi_deadline(0) {}
+          cgi_pid(-1), status_code(0), cgi_in_offset(0), cgi_deadline(0),
+          chunked_scan_pos(0) {}
 };
 
 // These two functions are the entire HTTP + CGI contract with the core

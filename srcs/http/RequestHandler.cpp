@@ -425,7 +425,10 @@ void handle_request(Connection& conn) {
             serveAutoindex(conn, fsPath, conn.path);
             return;
         }
-        request_handler::writeErrorResponse(conn, 403);
+        // 404, not 403: from the client's perspective there's simply no
+        // resource at this URL (matches the official 42 tester's own
+        // expectation -- verified live against it).
+        request_handler::writeErrorResponse(conn, 404);
         return;
     }
 

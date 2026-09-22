@@ -13,23 +13,15 @@ const size_t MAX_URI_LENGTH = 8000;
 
 namespace request_parser {
 
-/**
- * @brief Decodes one RFC 7230 chunked body (size lines + trailer).
- *
- * @param data      Raw bytes starting at the first chunk-size line.
- * @param out       Filled with the decoded payload on success.
- * @param consumed  Filled with how many bytes of `data` were used up,
- *                  including the terminating "0\r\n\r\n".
- * @param malformed Set to true if the encoding itself is broken (bad hex
- *                  size, missing CRLF, ...). Left false if we just don't
- *                  have the full body yet.
- * @return true once the whole chunked body has been decoded, false if more
- *         data is needed or the encoding is malformed.
- */
-bool decodeChunked(const std::string& data, std::string& out, size_t& consumed, bool& malformed) {
+bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bool& malformed) {
     malformed = false;
-    size_t pos = 0;
-    std::string result;
+    const std::string& data = conn.read_buffer;
+    // Resume exactly where the last call left off -- everything before
+    // this point is already a confirmed, complete chunk whose payload is
+    // already sitting in conn.body. See the field's comment in
+    // connection.hpp for why re-scanning from bodyStart every call (the
+    // previous implementation) is a correctness-preserving but O(n^2) trap.
+    size_t pos = bodyStart + conn.chunked_scan_pos;
 
     while (true) {
         size_t lineEnd = data.find("\r\n", pos);
@@ -53,12 +45,12 @@ bool decodeChunked(const std::string& data, std::string& out, size_t& consumed, 
             return false;
         }
         size_t chunkSize = static_cast<size_t>(chunkSizeLong);
-        pos = lineEnd + 2;
+        size_t chunkDataStart = lineEnd + 2;
 
         if (chunkSize == 0) {
             // Trailer section: zero or more "Name: value\r\n" lines,
             // terminated by a lone blank "\r\n".
-            size_t p = pos;
+            size_t p = chunkDataStart;
             while (true) {
                 size_t nl = data.find("\r\n", p);
                 if (nl == std::string::npos)
@@ -69,19 +61,19 @@ bool decodeChunked(const std::string& data, std::string& out, size_t& consumed, 
                 }
                 p = nl + 2;
             }
-            consumed = p;
-            out = result;
+            totalConsumed = p - bodyStart;
             return true;
         }
 
-        if (data.size() < pos + chunkSize + 2)
+        if (data.size() < chunkDataStart + chunkSize + 2)
             return false;  // wait for the rest of this chunk
-        if (data.compare(pos + chunkSize, 2, "\r\n") != 0) {
+        if (data.compare(chunkDataStart + chunkSize, 2, "\r\n") != 0) {
             malformed = true;
             return false;
         }
-        result.append(data, pos, chunkSize);
-        pos = pos + chunkSize + 2;
+        conn.body.append(data, chunkDataStart, chunkSize);
+        pos = chunkDataStart + chunkSize + 2;
+        conn.chunked_scan_pos = pos - bodyStart;  // commit: this chunk is done, never redo it
     }
 }
 
@@ -311,23 +303,38 @@ bool try_parse_request(Connection& conn) {
             failParse(conn, 413, buf.size(), true);
             return true;
         }
-        std::string encoded = buf.substr(bodyStart);
-        std::string decoded;
-        size_t consumed = 0;
+        size_t totalConsumed = 0;
         bool malformed = false;
-        if (!request_parser::decodeChunked(encoded, decoded, consumed, malformed)) {
+        if (!request_parser::decodeChunked(conn, bodyStart, totalConsumed, malformed)) {
             if (malformed) {
                 failParse(conn, 400, buf.size(), true);
+                conn.body.clear();
+                conn.chunked_scan_pos = 0;
+                return true;
+            }
+            // Still incomplete: conn.body/conn.chunked_scan_pos already
+            // reflect every chunk confirmed so far (see decodeChunked's
+            // comment), so the *next* call resumes there instead of
+            // re-scanning from bodyStart -- checked here too, not just at
+            // the end, so a runaway body is rejected as soon as it crosses
+            // the limit rather than only once fully terminated.
+            if (conn.body.size() > maxBody) {
+                failParse(conn, 413, buf.size(), true);
+                conn.body.clear();
+                conn.chunked_scan_pos = 0;
                 return true;
             }
             return false;  // wait for the rest of the chunked body
         }
-        if (decoded.size() > maxBody) {
-            failParse(conn, 413, bodyStart + consumed, true);
+        if (conn.body.size() > maxBody) {
+            failParse(conn, 413, bodyStart + totalConsumed, true);
+            conn.body.clear();
+            conn.chunked_scan_pos = 0;
             return true;
         }
-        body = decoded;
-        buf.erase(0, bodyStart + consumed);
+        body = conn.body;
+        conn.chunked_scan_pos = 0;  // ready for the next request on this connection
+        buf.erase(0, bodyStart + totalConsumed);
     } else {
         std::map<std::string, std::string>::const_iterator clHeader = headers.find("content-length");
         if (clHeader != headers.end()) {
