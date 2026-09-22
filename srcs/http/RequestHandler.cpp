@@ -380,7 +380,13 @@ void handle_request(Connection& conn) {
 
     if (conn.method == "POST") {
         if (!loc->upload_enabled) {
-            request_handler::writeErrorResponse(conn, 403);
+            // A location can allow POST without configuring upload_store --
+            // it's just not meant to persist anything (e.g. accepting a
+            // body without storing it). Acknowledge rather than reject:
+            // methodAllowed() above is what actually gates whether POST is
+            // permitted here at all.
+            conn.status_code = 200;
+            request_handler::writeResponse(conn, 200, "text/plain", "OK\n");
             return;
         }
         std::string filename = basenameOf(rel);
