@@ -40,6 +40,12 @@ struct Connection {
     size_t bytes_written;
     bool keep_alive;
 
+    // ADDED (Core Server side): wall-clock timestamp of the last read/write
+    // on this connection, refreshed by the Core Server. Needed so the
+    // server's poll() loop can sweep and close idle connections instead of
+    // holding a client fd open forever.
+    time_t last_activity;
+
     // ADDED (Core Server side, not in the original guide table): the
     // config block matched to whichever listening socket accepted this
     // connection. The core server sets this once, right after accept(),
@@ -89,8 +95,8 @@ struct Connection {
 
     Connection()
         : fd(-1), state(READING_REQUEST), bytes_written(0), keep_alive(true),
-          server_conf(0), cgi_stdin_fd(-1), cgi_stdout_fd(-1), cgi_pid(-1),
-          status_code(0), cgi_in_offset(0), cgi_deadline(0) {}
+          last_activity(0), server_conf(0), cgi_stdin_fd(-1), cgi_stdout_fd(-1),
+          cgi_pid(-1), status_code(0), cgi_in_offset(0), cgi_deadline(0) {}
 };
 
 // These two functions are the entire HTTP + CGI contract with the core
