@@ -28,6 +28,7 @@ private:
 	typedef std::map<int, Connection>		ConnMap;
 	typedef std::map<int, Socket*>			ListenMap;
 	typedef std::map<int, const ServerConfig*>	ListenConfigMap;
+	typedef std::map<int, int>				CgiPipeMap;	// pipe fd -> client fd qui le possede
 
 	/* --- poll_fds : la liste donnee a poll()        (ServerRegistry.cpp) --- */
 	void			addPollFd(int fd, short events);
@@ -64,12 +65,22 @@ private:
 	/* --- timeouts (partie 9)                            (ServerTimeouts.cpp) --- */
 	void			sweepTimeouts(void);
 
+	/* --- CGI : pipes greffes sur le meme poll_fds partage    (ServerCgi.cpp) --- */
+	void			registerCgiFds(Connection& conn);
+	bool			handleCgiEvent(int fd, short revents);
+	void			removeCgiPipe(int fd);
+	void			killCgi(Connection& conn);
+	void			sweepCgi(void);
+	void			reapPending(void);
+
 	std::vector<ServerConfig>	_configs;		// blocs "server{}" parses (src/config)
 	std::vector<Socket*>		_listeners;		// possede les sockets d'ecoute
 	ListenMap					_listen_fds;	// fd d'ecoute -> son Socket (non possede)
 	ListenConfigMap				_listener_config;	// fd d'ecoute -> la ServerConfig qu'il sert
 	std::vector<struct pollfd>	_poll_fds;		// le tableau donne a poll()
 	ConnMap						_connections;	// fd client -> sa Connection
+	CgiPipeMap					_cgi_owner;		// pipe stdin/stdout d'un CGI -> fd client proprietaire
+	std::vector<pid_t>			_pending_reap;	// pids de CGI tues/finis pas encore reapable
 	int							_spare_fd;		// fd garde en reserve (/dev/null), voir rejectWhenOutOfFds
 };
 

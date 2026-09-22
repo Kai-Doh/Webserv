@@ -1,6 +1,8 @@
 #include "core/Server.hpp"
 
+#include <csignal>
 #include <stdexcept>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "net/ListenSockets.hpp"
@@ -62,13 +64,32 @@ Server::Server(const std::vector<ServerConfig>& configs) : _configs(configs), _s
 }
 
 /**
- * @brief Ferme tous les fd clients restants, le fd de reserve, puis les sockets d'ecoute
+ * @brief Ferme tous les fd clients restants (tue et reap d'abord tout CGI
+ *        encore en cours pour eux), les pipes de CGI, le fd de reserve,
+ *        puis les sockets d'ecoute
+ *        Le reap ici est bloquant (waitpid sans WNOHANG) : le processus
+ *        s'arrete de toute facon, ce n'est plus le tour de boucle poll()
+ *        qu'il faudrait garder non-bloquant, seulement eviter de laisser
+ *        des zombies derriere soi.
  */
 Server::~Server(void)
 {
-	for (ConnMap::iterator it = _connections.begin(); it != _connections.end(); ++it)
+	for (CgiPipeMap::iterator it = _cgi_owner.begin(); it != _cgi_owner.end(); ++it)
 		close(it->first);
+	_cgi_owner.clear();
+	for (ConnMap::iterator it = _connections.begin(); it != _connections.end(); ++it)
+	{
+		if (it->second.cgi_pid != -1)
+		{
+			kill(it->second.cgi_pid, SIGKILL);
+			waitpid(it->second.cgi_pid, NULL, 0);
+		}
+		close(it->first);
+	}
 	_connections.clear();
+	for (size_t i = 0; i < _pending_reap.size(); ++i)
+		waitpid(_pending_reap[i], NULL, 0);
+	_pending_reap.clear();
 	if (_spare_fd != -1)
 		close(_spare_fd);
 	_poll_fds.clear();

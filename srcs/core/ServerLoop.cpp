@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -38,14 +39,26 @@ void	Server::installSignalHandlers(void)
 
 /**
  * @brief Fait tourner le serveur jusqu'a SIGINT / SIGTERM (la seule boucle poll())
- * @throw std::runtime_error en cas d'erreur irrecuperable de poll() / d'un socket d'ecoute
+ *        Sujet p.3 : "ne doit jamais crasher, meme a court de memoire" --
+ *        runOnce() peut lever (poll() casse, std::bad_alloc, ...) ; on
+ *        contient chaque tour a lui-meme plutot que de laisser une
+ *        exception tuer tout le processus.
  */
 void	Server::run(void)
 {
 	g_stop_requested = 0;
 	installSignalHandlers();
 	while (!g_stop_requested)
-		runOnce(POLL_TIMEOUT_MS);
+	{
+		try
+		{
+			runOnce(POLL_TIMEOUT_MS);
+		}
+		catch (const std::exception& e)
+		{
+			std::cerr << "[run] tour de boucle en echec : " << e.what() << std::endl;
+		}
+	}
 }
 
 /**
@@ -70,18 +83,28 @@ void	Server::runOnce(int timeout_ms)
 	}
 	if (ready > 0)
 		dispatchEvents();
+	// Run every tour, not only when poll() reported something new: a CGI
+	// that just crossed its deadline, or whose pipes closed but wasn't
+	// immediately reapable (see cgi_handler::finish()), has nothing new
+	// to signal on its own fd.
+	sweepCgi();
+	reapPending();
 	sweepTimeouts();
 }
 
 /**
  * @brief Parcourt poll_fds apres un reveil et route chaque fd pret
  *        - fd d'ecoute pret            -> acceptNewClient()
+ *        - pipe de CGI pret            -> handleCgiEvent()
  *        - fd client avec un evenement -> handleClientEvent()
- *        - les clients passes a DONE sont retires APRES le parcours
+ *        - clients DONE et pipes de CGI fermes sont retires APRES le
+ *          parcours : erase() au milieu de poll_fds pendant qu'on
+ *          l'indexe encore decalerait tout ce qui suit
  */
 void	Server::dispatchEvents(void)
 {
 	std::vector<int>	to_close;
+	std::vector<int>	cgi_to_remove;
 	size_t				count = _poll_fds.size();
 	Connection			*conn;
 
@@ -100,6 +123,12 @@ void	Server::dispatchEvents(void)
 				acceptNewClient(fd);
 			continue ;
 		}
+		if (_cgi_owner.find(fd) != _cgi_owner.end())
+		{
+			if (handleCgiEvent(fd, revents))
+				cgi_to_remove.push_back(fd);
+			continue ;
+		}
 		conn = findConnection(fd);
 		if (conn == NULL)
 			continue ;
@@ -107,6 +136,8 @@ void	Server::dispatchEvents(void)
 		if (conn->state == DONE)
 			to_close.push_back(fd);
 	}
+	for (size_t k = 0; k < cgi_to_remove.size(); ++k)
+		removeCgiPipe(cgi_to_remove[k]);
 	for (size_t k = 0; k < to_close.size(); ++k)
 		removeConnection(to_close[k]);
 }

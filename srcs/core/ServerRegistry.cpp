@@ -146,10 +146,18 @@ void	Server::resetConnectionForReuse(Connection& conn)
 	conn.cgi_pid = -1;
 	conn.cgi_out.clear();
 	conn.cgi_in_offset = 0;
+	conn.headers_ready = false;
+	conn.body_start = 0;
+	conn.chunked_scan_pos = 0;
 }
 
 /**
- * @brief Oublie completement un client : entree poll_fds, Connection, puis close(fd)
+ * @brief Oublie completement un client : CGI en cours (s'il y en a un),
+ *        entree poll_fds, Connection, puis close(fd)
+ *        Un client peut partir (timeout, erreur socket) pendant qu'un CGI
+ *        tourne encore pour lui (etat CGI_RUNNING) : sans ce nettoyage, ses
+ *        pipes resteraient enregistres dans poll_fds pour un fd deja ferme,
+ *        et le processus CGI ne serait jamais tue ni reapable.
  * @param fd Descripteur de fichier client
  */
 void	Server::removeConnection(int fd)
@@ -158,6 +166,7 @@ void	Server::removeConnection(int fd)
 
 	if (it == _connections.end())
 		return ;
+	killCgi(it->second);
 	removePollFd(fd);
 	_connections.erase(it);
 	close(fd);
@@ -171,7 +180,7 @@ bool	Server::checkInvariant(void) const
 {
 	std::set<int>	seen;
 
-	if (_poll_fds.size() != _listen_fds.size() + _connections.size())
+	if (_poll_fds.size() != _listen_fds.size() + _connections.size() + _cgi_owner.size())
 		return (false);
 	for (size_t i = 0; i < _poll_fds.size(); ++i)
 	{
@@ -179,7 +188,8 @@ bool	Server::checkInvariant(void) const
 
 		if (!seen.insert(fd).second)
 			return (false);
-		if (!isListenFd(fd) && _connections.find(fd) == _connections.end())
+		if (!isListenFd(fd) && _connections.find(fd) == _connections.end()
+			&& _cgi_owner.find(fd) == _cgi_owner.end())
 			return (false);
 	}
 	for (ConnMap::const_iterator it = _connections.begin(); it != _connections.end(); ++it)
