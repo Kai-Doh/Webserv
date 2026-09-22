@@ -1482,26 +1482,107 @@ Connection: keep-alive
 
 ```
 
-Following this module's code exactly:
+Here is *every* function call this module makes to answer it, in the exact
+order it makes them, with the real argument values at each step — not just
+"which function runs," but **what gets put into it and what comes back
+out**.
 
-1. **`try_parse_request()`** (Chapter 2) finds `\r\n\r\n`, splits the
-   request line (`GET`, `/`, `HTTP/1.1`), parses the headers. `Host` is
-   present, version is `HTTP/1.1`, no `Content-Length`/`Transfer-Encoding`
-   — this is a bodiless `GET`. Returns `true` immediately; nothing to wait
-   on.
-2. **`handle_request()`** (Chapter 3): `matchLocation("/")` against
-   `conf/test.conf`'s `location / { root www; index index.html; methods
-   GET; }` — the only candidate, so it wins by default. No `return`
-   directive, `GET` is allowed, `rel` (path remainder) is empty, so
-   `joinPath("www", "")` resolves to `www` itself (Chapter 3.2's alias
-   rule: an empty remainder means "the root itself").
-3. **Chapter 4.3's `GET` branch**: `www` is a directory, the URL *does*
-   end in `/`, and `index index.html` is configured — `www/index.html`
-   exists and is a regular file, so `serveFile()` serves *that*, not a
-   listing.
-4. **`writeResponse()`** (Chapter 5.1) assembles the reply, real numbers
-   from this repository's own `www/index.html` (5394 bytes, last touched
-   2026-09-22 14:36:43 UTC):
+**1. `try_parse_request(conn)`** (Chapter 2) — after finding `\r\n\r\n` and
+splitting the request line, this is what ends up sitting in `conn` by the
+time it returns:
+
+```cpp
+conn.method       = "GET"
+conn.path         = "/"
+conn.query_string = ""
+conn.http_version = "HTTP/1.1"
+conn.headers      = { "host": "localhost", "user-agent": "Mozilla/5.0 ...",
+                       "accept": "text/html,...", "connection": "keep-alive" }
+conn.keep_alive   = true    // HTTP/1.1's default, confirmed by the Connection header
+conn.body         = ""      // no Content-Length, no Transfer-Encoding -> zero-byte body
+conn.status_code  = 0       // 0 means "no parse error" (Chapter 3 §1 checks this first)
+```
+`try_parse_request()` returns `true` — a complete, valid request. Nothing
+here required a second `read()`; it all arrived in one TCP segment.
+
+**2. `handle_request(conn)`** (Chapter 3) reads those fields back out and
+starts calling into the routing helpers, in order:
+
+```cpp
+const Location* loc = conn.server_conf->matchLocation("/");
+```
+`matchLocation()` (§3.1) walks every `location{}` in `conf/test.conf`'s
+first `server{}` block and checks each `path` against `"/"`:
+
+| Location's `path` | Does `"/"` match it? |
+|---|---|
+| `/` | yes — exact match, length 1 |
+| `/listing` | no (`"/"` doesn't start with `/listing`) |
+| `/cgi-bin`, `/upload`, `/old`, `/moved` | no, same reason |
+
+Only one candidate, so it wins by default: `loc` now points at the
+`location /` block — `loc->root == "www"`, `loc->index == "index.html"`,
+`loc->methods == ["GET"]`, `loc->autoindex == false`.
+
+```cpp
+loc->redirect_target.empty()      // -> true  (no `return` directive on this location) -> skip
+loc->methodAllowed("GET")         // -> true  ("GET" is in loc->methods) -> continue
+loc->root.empty()                 // -> false ("www") -> continue
+
+std::string rel = conn.path.substr(loc->path.size());
+// conn.path == "/", loc->path == "/", both length 1
+// -> rel = "/".substr(1) = ""
+
+hasDotDotSegment(rel)             // su::split("", '/') is empty -> no ".." segment -> false
+
+std::string fsPath = joinPath(loc->root, rel);
+// rel.empty() is true, so joinPath's first branch fires: return root as-is
+// -> fsPath = "www"
+
+struct stat st;
+bool exists = (stat(fsPath.c_str(), &st) == 0);
+// -> exists = true, S_ISDIR(st.st_mode) = true  ("www" is a directory)
+```
+
+Method isn't `DELETE`; the CGI check (`exists && S_ISREG(st.st_mode)`) is
+`false` because `www` is a *directory*, not a regular file, so `isCgi`
+stays `false`; method isn't `POST`; `exists` is `true` so the `404` branch
+is skipped. That leaves the directory branch from Chapter 4.3:
+
+```cpp
+// conn.path is "/", and conn.path[conn.path.size()-1] == '/' is true
+// -> the "needs a trailing slash" 301 branch is skipped entirely
+
+loc->index.empty()                // -> false, index == "index.html"
+std::string idx = joinPath(fsPath, loc->index);
+// -> idx = joinPath("www", "index.html") = "www/index.html"
+
+struct stat ist;
+stat(idx.c_str(), &ist) == 0 && S_ISREG(ist.st_mode)
+// -> true: www/index.html exists and is a regular file
+
+serveFile(conn, "www/index.html", ist, loc);
+```
+
+**3. `serveFile(conn, "www/index.html", ist, loc)`** (Chapter 4.3) —
+`ist.st_size` is this repository's real, current size for that file:
+
+```cpp
+std::ifstream file("www/index.html", std::ios::binary);   // opens fine
+body.resize(5394);                                        // ist.st_size == 5394
+file.read(&body[0], 5394);                                // whole file, one read
+conn.status_code = 200;
+writeResponse(conn, 200, http_status::mimeType("www/index.html"), body,
+              "Last-Modified: " + formatHttpDate(ist.st_mtime) + "\r\n");
+```
+`mimeType("www/index.html")` looks at the substring after the last `.` —
+`"html"` — and returns `"text/html"`. `formatHttpDate(ist.st_mtime)`
+turns this file's real, current modification time into
+`"Tue, 22 Sep 2026 14:36:43 GMT"`.
+
+**4. `writeResponse(conn, 200, "text/html", body, "Last-Modified: ...\r\n")`**
+(Chapter 5.1) assembles the actual bytes that go on the wire — real
+numbers throughout, nothing invented:
 
 ```
 HTTP/1.1 200 OK
@@ -1553,9 +1634,51 @@ Connection: keep-alive
 
 ```
 
-Same two functions, same location (`/styles.css` still only matches the
-catch-all `location /`, since there's no more specific location for it),
-different file:
+Same functions, different arguments — this time worth tracing precisely
+because the *decision* is subtly different, even though the outcome
+(another `200`) looks the same:
+
+```cpp
+try_parse_request(conn);
+// conn.method = "GET", conn.path = "/styles.css", conn.query_string = ""
+// (a fresh Connection state -- resetConnectionForReuse() cleared the
+// previous request's fields before this one arrived, per E.2)
+
+const Location* loc = conn.server_conf->matchLocation("/styles.css");
+// su::startsWith("/styles.css", "/listing") -> false
+// su::startsWith("/styles.css", "/cgi-bin") -> false
+// su::startsWith("/styles.css", "/")        -> true, and p == "/" so it counts
+// -> still only one match: the same `location /` block as request #1
+
+std::string rel = conn.path.substr(loc->path.size());
+// "/styles.css".substr(1) = "styles.css"   <- NOT empty this time
+
+hasDotDotSegment("styles.css");   // su::split gives {"styles.css"}, no ".." -> false
+
+std::string fsPath = joinPath("www", "styles.css");
+// rel isn't empty, root doesn't end in '/', rel doesn't start with '/'
+// -> joinPath's middle branch: "www" + "/" + "styles.css" = "www/styles.css"
+
+stat("www/styles.css", &st);
+// -> exists = true, S_ISREG(st.st_mode) = true   <- a FILE this time, not a directory
+
+extensionOf("www/styles.css");   // -> ".css"
+loc->cgi_extensions.find(".css");   // -> not found (this location configures no CGI at all)
+// -> isCgi stays false
+
+// method isn't DELETE, isn't POST; exists is true; S_ISDIR(st.st_mode) is
+// false (it's a file, not a directory) -> the whole directory branch
+// (index/autoindex/301) is skipped entirely this time
+
+serveFile(conn, "www/styles.css", st, loc);
+```
+
+The key difference from request #1: `rel` came out *non-empty*
+(`"styles.css"`), which sent `fsPath` down `joinPath()`'s other branch,
+and `stat()` found a regular file directly — no `index.html` lookup
+needed, because there was no directory to resolve an index *inside*.
+Same function, same location, genuinely different path through its logic,
+purely because of what `rel` turned out to be.
 
 ```
 HTTP/1.1 200 OK
@@ -1583,12 +1706,57 @@ Connection: keep-alive
 
 ```
 
-`matchLocation("/favicon.ico")` still lands on `location /` (its `root`
-is `www`, and there's no `www/favicon.ico` in this project). `handle_request()`
-reaches the `!exists` check in Chapter 4.3 and calls `writeErrorResponse()`
-(Chapter 5.2) — which finds `conf/test.conf`'s server-level
-`error_page 404 www/errors/404.html` and serves *that* instead of the
-generic built-in page:
+Traced the same way:
+
+```cpp
+const Location* loc = conn.server_conf->matchLocation("/favicon.ico");
+// same reasoning as before -> still only `location /` matches
+
+std::string rel = conn.path.substr(loc->path.size());
+// "/favicon.ico".substr(1) = "favicon.ico"
+
+std::string fsPath = joinPath("www", "favicon.ico");
+// -> "www/favicon.ico"
+
+struct stat st;
+bool exists = (stat("www/favicon.ico", &st) == 0);
+// -> exists = FALSE. This file was never added to www/ in this project.
+
+// exists && S_ISREG(...) is false (exists is false) -> the CGI `if` is
+// skipped; its `else if (!loc->cgi_extensions.empty())` is also false,
+// since `location /` configures no `cgi` directives at all -> isCgi stays
+// false either way
+
+// method isn't DELETE, isn't POST
+if (!exists) {
+    request_handler::writeErrorResponse(conn, 404, loc);
+    return;
+}
+```
+
+**`writeErrorResponse(conn, 404, loc)`** (Chapter 5.2) — this is where the
+"most specific setting wins" fallback chain actually runs:
+
+```cpp
+loc->error_pages.find(404);
+// `location /` itself never sets its own `error_page` directive
+// -> not found, first tier falls through
+
+conn.server_conf->error_pages.find(404);
+// conf/test.conf's server{} block DOES set: error_page 404 www/errors/404.html
+// -> found: "www/errors/404.html"
+
+std::ifstream file("www/errors/404.html", std::ios::binary);   // opens fine
+// -> reads all 162 bytes of this project's real custom 404 page
+
+writeResponse(conn, 404, http_status::mimeType("www/errors/404.html"), buf.str());
+// mimeType(...) -> "text/html" (same ".html" -> text/html rule as request #1)
+// no fourth argument this time -> extraHeaders defaults to "" -> no Last-Modified
+```
+
+Two tiers checked, the first came up empty, the second had exactly what
+was needed — the fallback chain from §5.2 isn't just a description, this
+is literally the two `if` blocks it's made of, run back to back:
 
 ```
 HTTP/1.1 404 Not Found
