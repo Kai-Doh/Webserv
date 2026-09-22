@@ -1,8 +1,8 @@
 #include "connection.hpp"
 #include "CgiHandler.hpp"
-#include "RequestHandler.hpp"
-#include "HttpStatus.hpp"
-#include "StringUtils.hpp"
+#include "http/RequestHandler.hpp"
+#include "http/HttpStatus.hpp"
+#include "utils/StringUtils.hpp"
 
 #include <unistd.h>
 #include <sys/wait.h>

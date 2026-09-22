@@ -1,6 +1,6 @@
 #include "connection.hpp"
 #include "RequestParser.hpp"
-#include "StringUtils.hpp"
+#include "utils/StringUtils.hpp"
 #include <cstdlib>
 #include <cctype>
 

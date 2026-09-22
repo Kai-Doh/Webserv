@@ -6,7 +6,7 @@
 #include <ctime>        // time_t
 #include <sys/types.h>  // pid_t
 
-#include "Config.hpp"
+#include "config/Config.hpp"
 
 // This header follows guide_jour1_HTTP_CGI.md part 3 for the fields owned
 // by each side of the project. Fields added beyond what the guide lists

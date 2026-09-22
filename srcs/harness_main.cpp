@@ -21,8 +21,8 @@
 // warning box: "Regular disk files are exempt"), so RequestHandler.cpp's
 // stat()/ifstream use is intentionally not routed through poll().
 #include "connection.hpp"
-#include "Config.hpp"
-#include "CgiHandler.hpp"
+#include "config/Config.hpp"
+#include "cgi/CgiHandler.hpp"
 
 #include <arpa/inet.h>
 #include <sys/socket.h>

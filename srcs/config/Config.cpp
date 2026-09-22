@@ -1,5 +1,5 @@
 #include "Config.hpp"
-#include "StringUtils.hpp"
+#include "utils/StringUtils.hpp"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>

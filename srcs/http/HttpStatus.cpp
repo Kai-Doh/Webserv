@@ -1,5 +1,5 @@
 #include "HttpStatus.hpp"
-#include "StringUtils.hpp"
+#include "utils/StringUtils.hpp"
 
 namespace http_status {
 

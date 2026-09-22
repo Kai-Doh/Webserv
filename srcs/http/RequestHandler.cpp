@@ -1,8 +1,8 @@
 #include "connection.hpp"
 #include "RequestHandler.hpp"
-#include "CgiHandler.hpp"
+#include "cgi/CgiHandler.hpp"
 #include "HttpStatus.hpp"
-#include "StringUtils.hpp"
+#include "utils/StringUtils.hpp"
 
 #include <sys/stat.h>
 #include <dirent.h>
