@@ -291,17 +291,6 @@ bool try_parse_request(Connection& conn) {
         // request (there can be thousands while a large body streams in)
         // takes the `if (!conn.headers_ready)` branch above and skips
         // straight past it, reading these back out of conn instead.
-        //
-        // body_start is cached rather than re-derived via findHeaderEnd()
-        // on every call: that looks cheap (the "\r\n\r\n" separator sits at
-        // a small, fixed, early offset) but findHeaderEnd() *also*
-        // unconditionally searches for a bare "\n\n" telnet fallback, an
-        // unrelated 2-byte pattern nothing guarantees resolves early --
-        // for a large binary/chunked body that never happens to contain
-        // one, that search runs to the end of read_buffer every single
-        // call. Measured live: 9+ minutes of a stress-test run spent
-        // almost entirely in that one call before this was found by
-        // timing every step of this function directly.
         conn.method = method;
         conn.path = collapseSlashes(su::urlDecode(rawPath));
         conn.query_string = queryString;

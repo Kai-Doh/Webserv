@@ -11,25 +11,25 @@ struct Connection;
 
 namespace request_parser {
 
-// Incrementally decodes an RFC 7230 chunked body living in
-// conn.read_buffer at [bodyStart, ...), resuming from conn.chunked_scan_pos
-// so a body spread across many partial read()s is only ever scanned once
-// in total (see the field's comment in connection.hpp for why that
-// matters). Each fully-received chunk's payload is appended straight to
-// conn.body as soon as it's confirmed, and conn.chunked_scan_pos advances
-// past it -- so on the call that finally returns true, conn.body already
-// holds the complete decoded payload.
-//
-// @param conn          Connection being parsed.
-// @param bodyStart     Offset into conn.read_buffer where the chunked
-//                       stream begins.
-// @param totalConsumed Set, once true is returned, to how many bytes from
-//                       bodyStart made up the whole encoded stream
-//                       (including the terminating "0\r\n\r\n").
-// @param malformed     Set to true if the encoding itself is broken.
-// @return true once the terminating chunk + trailer has been seen; false
-//         if more data is needed (conn.body/conn.chunked_scan_pos already
-//         reflect everything confirmed so far) or the encoding is invalid.
+/**
+ * @brief Incrementally decodes an RFC 7230 chunked body, resuming from
+ *        conn.chunked_scan_pos so a body spread across many partial
+ *        read()s is only ever scanned once in total.
+ *
+ * Each fully-received chunk's payload is appended straight to conn.body
+ * as soon as it's confirmed; on the call that finally returns true,
+ * conn.body already holds the complete decoded payload.
+ *
+ * @param conn          Connection being parsed.
+ * @param bodyStart     Offset into conn.read_buffer where the chunked
+ *                       stream begins.
+ * @param totalConsumed Set, once true is returned, to how many bytes from
+ *                       bodyStart made up the whole encoded stream
+ *                       (including the terminating "0\r\n\r\n").
+ * @param malformed     Set to true if the encoding itself is broken.
+ * @return true once the terminating chunk + trailer has been seen; false
+ *         if more data is needed or the encoding is invalid.
+ */
 bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bool& malformed);
 
 }  // namespace request_parser
