@@ -254,8 +254,8 @@ bool start(Connection& conn, const std::string& scriptPath, const std::string& i
         _exit(127);  // execve failed
     }
 
-    // --- parent: nothing here blocks or polls on its own; the harness
-    // drives these two fds through the shared poll() from here on ---
+    // --- parent: nothing here blocks or polls on its own; the Core
+    // Server drives these two fds through the shared poll() from here on ---
     close(inPipe[0]);
     close(outPipe[1]);
     fcntl(inPipe[1], F_SETFL, O_NONBLOCK);
@@ -291,10 +291,10 @@ void onStdinWritable(Connection& conn) {
     // NOTE: deliberately never close(conn.cgi_stdin_fd) here -- only mark
     // it -1. Closing it immediately would free the fd number for reuse by
     // a later accept()/pipe() call within the *same* poll() iteration,
-    // while the harness's poll_fds/cgiOwner bookkeeping for this fd is
-    // still deferred to that iteration's single end-of-pass cleanup; the
-    // harness closes it exactly once there, after seeing cgi_stdin_fd
-    // become -1 (see the caller in harness_main.cpp).
+    // while the Core Server's poll_fds bookkeeping for this fd is still
+    // deferred to that iteration's single end-of-pass cleanup; it closes
+    // the fd exactly once there, after seeing cgi_stdin_fd become -1 (see
+    // the caller in srcs/core/ServerCgi.cpp).
     size_t remaining = conn.body.size() - conn.cgi_in_offset;
     ssize_t n = write(conn.cgi_stdin_fd, conn.body.data() + conn.cgi_in_offset, remaining);
     if (n > 0) {
@@ -381,9 +381,9 @@ bool finish(Connection& conn, pid_t& pendingPid) {
  */
 pid_t abortTimeout(Connection& conn) {
     // Same "never close() here" reasoning as onStdinWritable()/
-    // onStdoutReadable() above -- the caller (harness_main.cpp) captures
-    // conn.cgi_stdin_fd/cgi_stdout_fd *before* calling this and defers
-    // their actual close() to its single end-of-iteration cleanup.
+    // onStdoutReadable() above -- the caller (srcs/core/ServerCgi.cpp)
+    // captures conn.cgi_stdin_fd/cgi_stdout_fd *before* calling this and
+    // defers their actual close() to its own bookkeeping.
     if (conn.cgi_pid == -1) {
         // Never reachable via the guarded call site today, but kill(-1,
         // SIGKILL) -- "signal every process this user can reach" -- is

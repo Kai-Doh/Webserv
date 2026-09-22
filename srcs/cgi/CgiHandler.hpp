@@ -7,10 +7,10 @@
 struct Connection;
 struct Location;
 
-// CGI execution, driven by the *single* shared poll() loop in
-// harness_main.cpp -- no function in here ever blocks or runs its own
+// CGI execution, driven by the *single* shared poll() loop in the Core
+// Server (srcs/core/) -- no function in here ever blocks or runs its own
 // poll()/select(). start() forks the CGI and returns immediately; the
-// harness then calls onStdinWritable()/onStdoutReadable() only when
+// Core Server then calls onStdinWritable()/onStdoutReadable() only when
 // poll() has actually reported that pipe as ready, exactly like it does
 // for client sockets, and finish() once both sides are done.
 namespace cgi_handler {
@@ -21,7 +21,7 @@ namespace cgi_handler {
 // stdin is closed immediately in that case, there's nothing to write).
 // Also sets conn.cgi_deadline. Returns true on success, in which case the
 // caller (RequestHandler) is expected to set conn.state = CGI_RUNNING and
-// the harness to register whichever of the two fds are non -1 with
+// the Core Server to register whichever of the two fds are non -1 with
 // poll(). On failure, writes a complete error response into
 // conn.write_buffer itself (conn.state is left untouched: the normal
 // PROCESSING -> WRITING_RESPONSE transition applies, nothing to poll).

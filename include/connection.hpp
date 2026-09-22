@@ -21,7 +21,7 @@
 // may now leave a connection in this state instead of WRITING_RESPONSE
 // when it started a CGI process, and the core server loop drives that
 // CGI's two pipes through the *same* poll_fds array as every socket
-// (see harness_main.cpp) until it's done, at which point cgi_handler
+// (see srcs/core/ServerCgi.cpp) until it's done, at which point cgi_handler
 // moves the connection to WRITING_RESPONSE like any other request.
 enum ConnState {
     READING_REQUEST,
