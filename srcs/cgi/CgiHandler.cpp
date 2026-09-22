@@ -63,11 +63,21 @@ std::vector<std::string> buildEnv(const Connection& conn, const std::string& scr
     if (!conn.cgi_path_info.empty() && conn.cgi_path_info.size() <= scriptName.size())
         scriptName.erase(scriptName.size() - conn.cgi_path_info.size());
 
+    // The official 42 cgi_tester binary (subject-provided) checks PATH_INFO
+    // against the *full* request path when the script itself is the exact
+    // request target, not empty as RFC 3875 would have it -- confirmed by
+    // running cgi_tester directly with controlled env vars until "PATH_INFO
+    // incorrect"/"not found" stopped firing. Only fall back to that when
+    // there's genuinely no RFC-3875 extra-path component, so a real
+    // PATH_INFO-walking request (e.g. /cgi-bin/script.py/extra/thing) still
+    // gets the standards-correct trailing segment.
+    std::string pathInfoEnv = conn.cgi_path_info.empty() ? conn.path : conn.cgi_path_info;
+
     std::vector<std::string> env;
     env.push_back("REQUEST_METHOD=" + conn.method);
     env.push_back("SCRIPT_NAME=" + scriptName);
     env.push_back("SCRIPT_FILENAME=" + scriptPath);
-    env.push_back("PATH_INFO=" + conn.cgi_path_info);
+    env.push_back("PATH_INFO=" + pathInfoEnv);
     env.push_back("QUERY_STRING=" + conn.query_string);
     env.push_back("CONTENT_LENGTH=" + su::toString(conn.body.size()));
 
