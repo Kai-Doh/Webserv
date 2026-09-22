@@ -312,6 +312,99 @@ binary's setup instructions demand).
 
 ---
 
+## Part 2a — Quick reference: structures & functions
+
+A scannable index to keep open while reading source — Part 1 explains the
+*flow*, this is the *map*. One row per struct field / function; file:line so
+you can jump straight there.
+
+### `Connection` — one per client fd (`include/connection.hpp`)
+
+There's no separate "connection ID" anywhere in the code: the client's fd
+(from `accept()`) is both the key into `Server`'s `ConnMap` and
+`conn.fd` itself. Every buffer below is private to that one connection —
+nothing here is shared across fds.
+
+| Field | Type | Purpose |
+|---|---|---|
+| `fd` | `int` | This connection's socket fd — same value as its key in `Server::_connections`. |
+| `state` | `ConnState` | `READING_REQUEST` → `PROCESSING` → (`CGI_RUNNING` →) `WRITING_RESPONSE` → `DONE`. Drives which `Server::handle*()` function runs on the next `poll()` event (`ServerLoop.cpp:handleClientEvent`). |
+| `read_buffer` | `string` | Raw bytes from `read()`, appended to on every `handleRead()` call. Trimmed from the front once a full request is consumed — leftover bytes here are a pipelined *next* request. |
+| `write_buffer` | `string` | The complete response, built once by `writeResponse()`. Sent out over possibly several `write()`s. |
+| `bytes_written` | `size_t` | How much of `write_buffer` has gone out so far — `handleWrite()`'s resume point. |
+| `keep_alive` | `bool` | Whether to reset for another request after this one finishes, or close the fd. |
+| `last_activity` | `time_t` | Updated on every successful read/write; `sweepTimeouts()` closes fds silent for 60s+. |
+| `server_conf` | `const ServerConfig*` | Which `server{}` block this connection belongs to — set once at `accept()` time, from the listening socket it arrived on. |
+| `method`, `path`, `http_version` | `string` | Parsed request line. `path` is already URL-decoded + slash-collapsed. |
+| `headers` | `map<string,string>` | Lower-cased header names → values. |
+| `body` | `string` | The fully assembled request body (post Content-Length/chunked decoding). |
+| `query_string` | `string` | Everything after `?` in the target — **not** URL-decoded (kept raw for CGI's `QUERY_STRING`). |
+| `cgi_stdin_fd`, `cgi_stdout_fd` | `int` | This connection's CGI pipe fds; `-1` once each side is done (see `CgiHandler.cpp`'s note on why they're marked, not `close()`'d, inline). |
+| `cgi_pid` | `pid_t` | The CGI child's pid; `-1` when none is running. |
+| `cgi_path_info` | `string` | RFC 3875 `PATH_INFO` — the trailing path segment past the script, if any. |
+| `status_code` | `int` | Set by a parse failure (`failParse()`) or by `handle_request()`; `0` means "no error yet". |
+| `cgi_out` | `string` | Accumulated CGI stdout bytes, fed to `finishFromCgiOutput()` once done. |
+| `cgi_in_offset` | `size_t` | How much of `body` has already been written to the CGI's stdin. |
+| `cgi_deadline` | `time_t` | `start()` time + 10s; `sweepCgi()` SIGKILLs past this. |
+| `headers_ready` | `bool` | **Perf-critical cache**: true once the request line + headers are parsed for the *current* request, so every later `try_parse_request()` call (as more body bytes trickle in) skips re-parsing them from scratch. |
+| `body_start` | `size_t` | Cached offset into `read_buffer` where the body begins — the O(n²) fix from Part 1 §2.6. |
+| `chunked_scan_pos` | `size_t` | Cached offset into an in-progress chunked body already decoded — same O(n²) fix, for `decodeChunked()`. |
+
+`ConnState` enum: `READING_REQUEST`, `PROCESSING`, `CGI_RUNNING`,
+`WRITING_RESPONSE`, `DONE`.
+
+### `Server`'s own fd bookkeeping (`srcs/core/Server.hpp`, core-side — referenced here only because it's what actually holds one `Connection` per fd)
+
+| Member | Type | Purpose |
+|---|---|---|
+| `_connections` | `map<int, Connection>` | The fd → `Connection` table itself — this *is* "a buffer per connection ID". |
+| `_poll_fds` | `vector<pollfd>` | The flat array handed to `poll()` every iteration: every listener, every client fd, every CGI pipe, all in one call. |
+| `_listen_fds` | `map<int, Socket*>` | Listening-socket fd → the `Socket` object (not owned here). |
+| `_listener_config` | `map<int, const ServerConfig*>` | Listening-socket fd → which `server{}` block it serves, so a new client inherits the right config at `accept()`. |
+| `_cgi_owner` | `map<int, int>` | A CGI pipe fd → the *client* fd that owns it, so a pipe event (`handleCgiEvent()`) can find the right `Connection`. |
+| `_pending_reap` | `vector<pid_t>` | CGI pids killed/finished but not yet `waitpid()`-reapable; retried non-blockingly every loop (`reapPending()`). |
+| `_spare_fd` | `int` | A held-back `/dev/null` fd, freed then immediately reused to `accept()`-and-drop a client when the process is out of fds (`rejectWhenOutOfFds()`). |
+
+### `Location` / `ServerConfig` (`srcs/config/Config.hpp`)
+
+| Struct | Key fields | Purpose |
+|---|---|---|
+| `Location` | `path`, `root`, `methods`, `autoindex`, `index`, `redirect_target`/`redirect_code`, `upload_enabled`/`upload_store`, `cgi_extensions` (map ext → interpreter), `client_max_body_size` (or `NO_BODY_SIZE_OVERRIDE`) | One `location{}` block. |
+| `ServerConfig` | `host`, `port`, `server_name`, `client_max_body_size`, `error_pages` (map code → path), `locations` | One `server{}` block. |
+
+### Function index — HTTP/CGI module
+
+| Function | Where | One-liner |
+|---|---|---|
+| `try_parse_request()` | `RequestParser.cpp:157` | Entry point: turns `conn.read_buffer` into a parsed request (or an error), incrementally. |
+| `request_parser::decodeChunked()` | `RequestParser.cpp:16` | Decodes a `Transfer-Encoding: chunked` body, resumable via `chunked_scan_pos`. |
+| `findHeaderEnd()` | `RequestParser.cpp:84` | Locates `\r\n\r\n` (or bare `\n\n`) — the header/body boundary. |
+| `collapseSlashes()` | `RequestParser.cpp:111` | Merges `//` runs so `//foo` and `/foo` route identically. |
+| `failParse()` | `RequestParser.cpp:132` | Sets `conn.status_code`, trims consumed bytes — every parse-error exit goes through here. |
+| `handle_request()` | `RequestHandler.cpp:249` | Entry point: routes a parsed request, writes a response (or starts a CGI). |
+| `joinPath()` | `RequestHandler.cpp:30` | Alias-style `root` + `rel` filesystem path join. |
+| `hasDotDotSegment()` | `RequestHandler.cpp:45` | Directory-traversal guard — rejects a literal `..` path segment. |
+| `extensionOf()` / `basenameOf()` | `RequestHandler.cpp:58` / `67` | Small path-string helpers (`.py`, last `/`-segment). |
+| `resolveCgiScript()` | `RequestHandler.cpp:94` | `PATH_INFO`-aware CGI lookup — finds a script hiding behind trailing segments. |
+| `serveFile()` / `serveAutoindex()` | `RequestHandler.cpp:127` / `148` | Static-file response / directory-listing response. |
+| `request_handler::writeResponse()` | `RequestHandler.cpp:193` | Assembles a full HTTP response into `conn.write_buffer`. |
+| `request_handler::writeErrorResponse()` | `RequestHandler.cpp:217` | Same, using a configured `error_page` if one exists for that code. |
+| `reasonPhrase()` / `defaultErrorBody()` / `mimeType()` | `HttpStatus.cpp:7` / `36` / `49` | Stateless status-code/MIME lookup tables. |
+| `cgi_handler::start()` | `CgiHandler.cpp:191` | Forks, pipes, `chdir()`s, `execve()`s — never blocks. |
+| `buildEnv()` | `CgiHandler.cpp:58` | Builds the full CGI/1.1 environment (RFC 3875). |
+| `cgi_handler::onStdinWritable()` / `onStdoutReadable()` | `CgiHandler.cpp:276` / `296` | One pipe I/O chunk per `poll()` event. |
+| `cgi_handler::isDone()` | `CgiHandler.cpp:308` | True once both CGI pipes are marked closed. |
+| `cgi_handler::finish()` | `CgiHandler.cpp:326` | Reaps + classifies the CGI's exit (`200`/`502`), or reports "not ready yet". |
+| `finishFromCgiOutput()` | `CgiHandler.cpp:117` | Parses the CGI's own `Status:`/`Content-Type:` out of its stdout, builds the response. |
+| `cgi_handler::abortTimeout()` | `CgiHandler.cpp:357` | `SIGKILL`s a CGI past its deadline, writes `504`. |
+| `cgi_handler::reapIfExited()` | `CgiHandler.cpp:379` | Non-blocking opportunistic `waitpid()` for `_pending_reap`. |
+| `Location::methodAllowed()` | `Config.cpp:9` | Is `method` in this location's allow-list? |
+| `ServerConfig::matchLocation()` | `Config.cpp:23` | Longest-prefix `location{}` match for a request path. |
+| `Config::load()` / `tokenize()` / `parseServer()` / `parseLocation()` | `Config.cpp:217` / `58` / `162` / `100` | Config-file reading → tokens → `ServerConfig`/`Location` structs. |
+| `su::trim` / `toLower` / `toUpper` / `split` / `startsWith` / `toString` / `toLong` / `urlDecode` / `headerKeyToEnv` | `StringUtils.cpp` | Small stateless string helpers everything above is built from. |
+
+---
+
 ## Part 3 — What's been verified
 
 Beyond ordinary `curl`, this module's behavior has been checked against:
