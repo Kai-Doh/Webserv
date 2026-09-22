@@ -353,9 +353,10 @@ bool finish(Connection& conn, pid_t& pendingPid) {
         return false;  // pipes closed but not reapable yet: caller retries later
 
     bool execFailed = WIFEXITED(status) && WEXITSTATUS(status) == 127;
+    bool crashed = WIFSIGNALED(status);  // e.g. a script that segfaults
     conn.cgi_pid = -1;
 
-    if (execFailed && conn.cgi_out.empty())
+    if ((execFailed || crashed) && conn.cgi_out.empty())
         request_handler::writeErrorResponse(conn, 502);
     else
         finishFromCgiOutput(conn, conn.cgi_out);

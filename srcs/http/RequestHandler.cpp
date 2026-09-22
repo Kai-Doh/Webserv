@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 
@@ -366,8 +367,12 @@ void handle_request(Connection& conn) {
         }
         std::string filename = basenameOf(rel);
         if (filename.empty()) {
+            // conn.fd alone is unique among connections open right now;
+            // std::time(0) makes it unique across restarts too. getpid()
+            // would do the same job but isn't on the subject's p.6
+            // authorized-function list.
             std::ostringstream gen;
-            gen << "upload_" << static_cast<long>(getpid()) << "_" << conn.fd;
+            gen << "upload_" << static_cast<long>(std::time(0)) << "_" << conn.fd;
             filename = gen.str();
         }
         std::string dest = joinPath(loc->upload_store, filename);

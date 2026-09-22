@@ -24,9 +24,9 @@
 #include "config/Config.hpp"
 #include "cgi/CgiHandler.hpp"
 
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <poll.h>
@@ -39,6 +39,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <sstream>
 #include <map>
 #include <vector>
 
@@ -60,6 +61,8 @@ void handleShutdownSignal(int) {
 const size_t READ_CHUNK = 4096;
 const int CGI_POLL_TIMEOUT_MS = 1000;   // wake up periodically to sweep CGI deadlines
 const int REAP_POLL_TIMEOUT_MS = 100;   // faster catch-up while zombies are pending reap
+const int IDLE_SWEEP_POLL_TIMEOUT_MS = 5000;  // periodic wake to sweep idle connections
+const time_t CONNECTION_IDLE_TIMEOUT_SECONDS = 60;  // matches core/ServerTimeouts.cpp
 
 /** @brief Sets O_NONBLOCK on a socket/pipe fd. */
 void setNonBlocking(int fd) {
@@ -68,33 +71,49 @@ void setNonBlocking(int fd) {
 
 /**
  * @brief Creates, binds and listens on one non-blocking TCP socket.
+ *
+ * Resolves host:port via getaddrinfo() (subject p.6's authorized-function
+ * list) rather than inet_pton(), which isn't on that list -- same
+ * technique as core/Socket.cpp's bindAddress().
+ *
  * @param host Interface to bind ("0.0.0.0"/empty for all interfaces).
  * @param port Port to listen on.
- * @return The listening fd, or -1 on any failure (already logged via perror).
+ * @return The listening fd, or -1 on any failure (already logged).
  */
 int openListenSocket(const std::string& host, int port) {
+    struct addrinfo hints;
+    struct addrinfo* res = 0;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    std::ostringstream portStream;
+    portStream << port;
+    const char* node = (host.empty() || host == "0.0.0.0") ? 0 : host.c_str();
+    int gaiRet = getaddrinfo(node, portStream.str().c_str(), &hints, &res);
+    if (gaiRet != 0) {
+        std::fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(gaiRet));
+        return -1;
+    }
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         std::perror("socket");
+        freeaddrinfo(res);
         return -1;
     }
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-    struct sockaddr_in addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (host.empty() || host == "0.0.0.0")
-        addr.sin_addr.s_addr = INADDR_ANY;
-    else
-        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-
-    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (bind(fd, res->ai_addr, res->ai_addrlen) < 0) {
         std::perror("bind");
+        freeaddrinfo(res);
         close(fd);
         return -1;
     }
+    freeaddrinfo(res);
+
     if (listen(fd, 128) < 0) {
         std::perror("listen");
         close(fd);
@@ -283,7 +302,10 @@ int main(int argc, char** argv) {
         // a tighter interval than the general CGI-deadline cadence so a
         // burst of finishing/killed CGIs gets swept up quickly rather
         // than lingering as visible (if harmless) zombies for seconds.
-        int timeout = -1;
+        // Bounded even when nothing CGI-related is pending, so the idle-
+        // connection sweep below actually gets a chance to run instead of
+        // poll() blocking indefinitely whenever no other activity happens.
+        int timeout = IDLE_SWEEP_POLL_TIMEOUT_MS;
         if (!pendingReap.empty() || anyCgiAwaitingReap)
             timeout = REAP_POLL_TIMEOUT_MS;
         else if (anyCgiRunning)
@@ -295,6 +317,14 @@ int main(int argc, char** argv) {
                 continue;
             break;
         }
+
+        // Subject p.8: "must not crash under any circumstances." Nothing
+        // in the block below is expected to throw, but std::string/
+        // std::vector/std::map allocations can (std::bad_alloc) under
+        // memory pressure, and this contains that to the current
+        // iteration -- logging and moving on -- instead of taking down
+        // every other connection this process is serving.
+        try {
 
         std::vector<int> fdsToRemove;
         std::vector<struct pollfd> fdsToAdd;
@@ -316,6 +346,7 @@ int main(int argc, char** argv) {
                         Connection conn;
                         conn.fd = clientFd;
                         conn.server_conf = listenIt->second;
+                        conn.last_activity = std::time(0);
                         connections[clientFd] = conn;
                         struct pollfd pfd;
                         pfd.fd = clientFd;
@@ -359,6 +390,7 @@ int main(int argc, char** argv) {
                 char buf[READ_CHUNK];
                 ssize_t n = read(fd, buf, sizeof(buf));
                 if (n > 0) {
+                    conn.last_activity = std::time(0);
                     conn.read_buffer.append(buf, static_cast<size_t>(n));
                     pump(conn, poll_fds[i], fdsToAdd, cgiOwner);
                 } else {
@@ -370,6 +402,7 @@ int main(int argc, char** argv) {
                 size_t remaining = conn.write_buffer.size() - conn.bytes_written;
                 ssize_t n = write(fd, conn.write_buffer.c_str() + conn.bytes_written, remaining);
                 if (n > 0) {
+                    conn.last_activity = std::time(0);
                     conn.bytes_written += static_cast<size_t>(n);
                     if (conn.bytes_written == conn.write_buffer.size()) {
                         if (conn.keep_alive) {
@@ -442,6 +475,20 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Idle-connection sweep: closes any non-CGI connection that hasn't
+        // sent or received a byte for CONNECTION_IDLE_TIMEOUT_SECONDS, so a
+        // client that opens a socket and goes silent (or stops reading a
+        // response) can't hold a slot open forever. CGI_RUNNING connections
+        // have their own, shorter cgi_deadline handled above instead.
+        time_t nowIdle = std::time(0);
+        for (std::map<int, Connection>::iterator it = connections.begin(); it != connections.end(); ++it) {
+            Connection& conn = it->second;
+            if (conn.state == CGI_RUNNING || conn.state == DONE)
+                continue;
+            if (nowIdle - conn.last_activity >= CONNECTION_IDLE_TIMEOUT_SECONDS)
+                fdsToRemove.push_back(conn.fd);
+        }
+
         // Opportunistic, non-blocking reap sweep -- never waitpid(..., 0).
         for (size_t k = 0; k < pendingReap.size();) {
             if (cgi_handler::reapIfExited(pendingReap[k]))
@@ -464,6 +511,12 @@ int main(int argc, char** argv) {
             }
             cgiOwner.erase(fd);
             connections.erase(fd);
+        }
+
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "event loop iteration failed: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "event loop iteration failed: unknown exception\n");
         }
     }
 
