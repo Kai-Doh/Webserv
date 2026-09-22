@@ -1,378 +1,1110 @@
-# Webserv — HTTP + CGI Module: Documentation
+# Webserv — HTTP + CGI Module: A Beginner's Guide
 
-This documents **Kai's half** of the two-person 42 `Webserv` project: HTTP
-request parsing, request routing, and CGI execution — everything reachable
-from `try_parse_request()` and `handle_request()`, the two functions that
-are the entire contract with the Core Server (William's half: sockets,
-`accept()`, the shared `poll()` loop, in `srcs/core/`).
+## What this document is
 
-Not covered here on purpose:
+This documents **Kai's half** of the two-person 42 `Webserv` project — the
+part of the server that speaks HTTP: reading a request off the wire,
+figuring out what it's asking for, and either answering it directly or
+handing it off to a CGI script. William's half (`srcs/core/`, `srcs/net/`)
+is the plumbing around it — opening sockets, accepting connections, and
+running the one `poll()` loop that makes the whole thing non-blocking. That
+part is only described here where it's needed for context, never in depth.
 
-- **The Core Server itself** (`srcs/core/`, `srcs/net/`) — William's part.
-  It's referenced below only where it calls into this module, since that's
-  the actual integration surface.
-- **Tooling/editor setup** — local machine configuration, not part of the
-  project.
+This version of the document is written for someone who has never built a
+web server before and wants to actually understand *why* the code looks the
+way it does, not just *what* it does. Every mechanism is explained from
+first principles, with a real-world comparison next to it where one helps,
+and every claim is backed by the actual file and function that implements
+it, so you can always go read the real thing right after.
 
-The two halves are wired together and run as one binary: `srcs/main.cpp`
-loads the config and hands off to `Server::run()` (`srcs/core/Server.cpp`),
-which drives `try_parse_request()`/`handle_request()` for every connection
-exactly the way this document describes.
-
----
-
-## Part 1 — The request lifecycle, start to finish
-
-This is the actual path a request takes through the code, in order. Every
-step names the file responsible.
-
-### 1. Startup and the event loop
-
-`srcs/main.cpp` resolves the config path (the argument if given, else
-`conf/default.conf` — subject p.8: "provided as an argument on the command
-line, or available in a default path"), calls `Config::load()`
-(`srcs/config/Config.cpp`) to parse it into one `ServerConfig` per
-`server{}` block, then constructs a `Server` and calls `run()`. A malformed
-config throws `std::runtime_error`, caught in `main()` and turned into a
-clean `exit(1)` — never a crash.
-
-From there it's the Core Server's loop: exactly **one** `poll()` call per
-iteration, covering every listening socket, every client socket, and every
-CGI pipe currently in flight — the subject's core requirement (p.8). After
-`poll()` returns, every fd with a nonzero `revents` is dispatched: a
-listening socket gets `accept()`ed; a CGI pipe is routed to
-`cgi_handler::onStdinWritable()`/`onStdoutReadable()`; a client socket in
-`READING_REQUEST` reaches this module's code, below.
-
-### 2. Read (`Server::handleRead()` → `srcs/http/RequestParser.cpp`)
-
-A ready client socket gets `read()`, the bytes are appended to
-`conn.read_buffer`, and **`try_parse_request(conn)`** is called — this is
-where this module's code starts.
-
-`try_parse_request()` works incrementally, since a request can arrive in
-pieces, and is called again on every partial read while the body is still
-streaming in:
-
-1. If headers aren't parsed yet for this request (`conn.headers_ready ==
-   false`): look for the header/body separator (`\r\n\r\n`, or a bare
-   `\n\n` for telnet-friendliness). Not found yet → return `false`, wait
-   for more bytes (unless the buffer's already past 8192 bytes with no
-   separator in sight → `431`).
-2. Once found, check the **request line's own length** first (→ `414` if
-   too long) *before* checking the whole header section's length (→
-   `431`) — a long URI always also blows past the header-section cap, so
-   checking section-size first would make `414` unreachable.
-3. Split into method / target / HTTP version. Reject a malformed line, an
-   empty or non-`/`-rooted target, a non-`HTTP/` version string (`400`),
-   or an unsupported version (`505`).
-4. Parse headers into a lower-cased `std::map`. A repeated
-   `Content-Length` with a *different* value is rejected (`400` — a
-   request-smuggling guard). `HTTP/1.1` with no `Host` header is rejected
-   (`400`).
-5. Decide keep-alive from the version + any `Connection` header.
-6. Commit `method`/`path`/`headers`/`query_string`/`keep_alive` and the
-   body's start offset into `conn` and set `conn.headers_ready = true` —
-   every later call for this same request skips steps 1–6 entirely and
-   reads these back out of `conn` instead. This isn't just an
-   optimization: re-deriving the body offset via a fresh string search on
-   every call, instead of caching it once, is what caused a real O(n²)
-   blowup found via the official tester's own stress test (20 concurrent
-   100MB CGI POSTs pegged a CPU core for 9+ minutes before the cache was
-   added — see `conn.headers_ready`'s and `conn.body_start`'s comments in
-   `include/connection.hpp`).
-7. Read the body: `Transfer-Encoding: chunked` goes through
-   `request_parser::decodeChunked()`, which also resumes from
-   `conn.chunked_scan_pos` rather than re-scanning already-decoded chunks
-   (the same O(n²) class of bug, found and fixed the same way); otherwise
-   `Content-Length` is trusted (bounds-checked against
-   `client_max_body_size` — server-wide, or a location's own override if
-   it set one — → `413`); no header at all means a zero-length body (RFC
-   7230 3.3.3 case 6 — not an error).
-8. On success, runs the decoded path through `collapseSlashes()` (so
-   `//foo` and `/foo` route identically) and returns `true`.
-
-Every failure path goes through `failParse()`, which sets
-`conn.status_code` and trims the offending bytes from `read_buffer` — it
-never throws, so a single bad request never takes the process down.
-
-### 3. Route (`srcs/http/RequestHandler.cpp`, `handle_request()`)
-
-Once `try_parse_request()` returns `true`, the Core Server calls
-**`handle_request(conn)`** — the other half of the contract. In order:
-
-1. If a parse error already set `conn.status_code`, write that error and
-   stop.
-2. `conn.server_conf->matchLocation(conn.path)` — longest-prefix match
-   (`srcs/config/Config.cpp`), nginx-style. A location declared with a
-   trailing slash (`/directory/`) also matches the slash-less form
-   (`/directory`), so step 10 below can redirect it properly instead of
-   404ing through the `/` catch-all.
-3. No match → `404`.
-4. A `return` directive on the location → the configured redirect code
-   (301/302/...) with a `Location` header.
-5. Method not in the location's `methods` list → `405` with an `Allow`
-   header listing what *is* allowed.
-6. Compute `rel` (path remainder after the location prefix) and reject any
-   `..` segment (`403`, directory-traversal guard) before touching the
-   filesystem at all.
-7. `DELETE`: 404 if the file doesn't exist, 403 if it's a directory,
-   `std::remove()` it, 204 on success (or 403 on failure).
-8. **CGI dispatch**: if the resolved path's extension is in the location's
-   `cgi_extensions` map — whether or not a real file exists there (some
-   interpreters, including the official 42 `cgi_tester` binary, answer
-   for *any* matching path regardless of the filesystem) — or a *prefix*
-   of the remaining path is such a file (RFC 3875 `PATH_INFO`, e.g.
-   `/cgi-bin/script.py/extra/thing`), hand off to `cgi_handler::start()`
-   and leave `conn.state = CGI_RUNNING` instead of writing a response
-   directly.
-9. `POST`: a location with no `upload_store` configured acknowledges with
-   `200` without persisting anything (a location can legitimately accept
-   a POST body it doesn't need to store); otherwise the body is written to
-   disk under `upload_store` (generating a filename if the URL didn't name
-   one) and the response is `201 Created`.
-10. Remaining case is `GET`: 404 if nothing's there; if it's a directory
-    without a trailing slash, `301` to the slash-terminated form (browsers
-    resolve relative links against the URL, so serving content at the
-    slash-less path breaks them); else serve the configured `index` file,
-    or an autoindex listing, or `404` if neither is available (not `403`
-    — from the client's perspective there's simply nothing at that URL);
-    otherwise serve the file directly with a guessed `Content-Type`.
-
-### 4a. Non-CGI response → write
-
-`handle_request()` filled `conn.write_buffer` via
-`request_handler::writeResponse()`/`writeErrorResponse()`
-(`RequestHandler.cpp`) — full status line, `Server`/`Connection`/
-`Content-Type`/`Content-Length` headers, plus the body (dropped entirely
-for `HEAD`, per RFC 7231 — sending it anyway desyncs a keep-alive
-connection for any compliant client). The Core Server flips that fd's poll
-events to `POLLOUT` and, once ready, writes the buffer — possibly across
-several `poll()` iterations for a large response. On completion:
-keep-alive resets the connection (including this module's per-request
-parser state — `headers_ready`, `body_start`, `chunked_scan_pos`) and
-immediately tries to parse again in case a pipelined next request is
-already sitting in the buffer; otherwise the connection closes.
-
-### 4b. CGI response → the pipe dance (`srcs/cgi/CgiHandler.cpp`)
-
-If `handle_request()` started a CGI, the Core Server registers
-`conn.cgi_stdin_fd`/`cgi_stdout_fd` (only whichever aren't `-1`) into the
-*same* `poll_fds` array as every socket. From here:
-
-- `cgi_handler::start()` already forked, `dup2()`'d the pipes into the
-  child's stdin/stdout, `chdir()`'d into the script's directory (so
-  relative file access from the script works), built the full CGI/1.1
-  environment via `buildEnv()`, and called `execve()`. The parent side
-  never blocks — it returns immediately with both fds non-blocking.
-- `PATH_INFO` is normally the RFC-3875 trailing path segment (empty when
-  the script itself is the exact request target). The official
-  `cgi_tester` binary instead expects it to equal the *full* request path
-  in that exact-match case — confirmed by running it directly with
-  controlled environment variables. `buildEnv()` only takes that fallback
-  when there's genuinely no RFC-3875 trailing segment, so a real
-  `PATH_INFO`-walking request is unaffected.
-- Every time `poll()` reports the stdin pipe writable, `onStdinWritable()`
-  writes one chunk of `conn.body`; every time it reports the stdout pipe
-  readable, `onStdoutReadable()` reads one chunk into `conn.cgi_out`.
-  Neither fd is `close()`'d by these functions, only marked `-1` — the
-  actual `close()` is deferred to the Core Server's own bookkeeping, so a
-  reused fd number can never collide with bookkeeping for the old one
-  still in flight.
-- Once both are `-1` (`isDone()`), `finish()` tries a non-blocking
-  `waitpid()` to tell an `execve()` failure (exit 127, no output → `502
-  Bad Gateway`) or a signal-killed script (e.g. a segfault) with no output
-  apart from a script that legitimately produced nothing (→ `200`). A
-  child's pipes closing and it becoming *reapable* are two separate
-  kernel events, so immediately after EOF `waitpid()` can still return 0;
-  `finish()` reports "not ready" instead of guessing, and the caller
-  retries on the next iteration.
-- If `conn.cgi_deadline` (10s from start) passes first, `abortTimeout()`
-  `SIGKILL`s the child and writes `504 Gateway Timeout` — the rest of the
-  server keeps serving other connections throughout (verified live: a
-  concurrent plain `GET` completes in under a millisecond while a hung
-  CGI is still in flight on another connection).
-- Either way, a still-unreaped pid is swept opportunistically
-  (`reapIfExited()`, non-blocking) — `waitpid(-1, ...)` ("reap anything")
-  is never called, since that could steal an unrelated CGI's exit status.
+If you already know HTTP servers inside and out, this document will feel
+slow. That's on purpose.
 
 ---
 
-## Part 2 — Every file (this module's)
+# Chapter 0 — The big picture: what is a web server, actually?
 
-### `include/` — the shared contract
+Strip away every buzzword and a web server is a very boring machine that
+does one thing, over and over, forever:
 
-**`connection.hpp`** — the canonical `Connection` struct and `ConnState`
-enum, shared with the Core Server (`srcs/core/`, `srcs/shared/`) via a
-forwarding header there — see its own comment for why. Fields owned by
-this module: `method`, `path`, `http_version`, `headers`, `body`,
-`query_string`, `cgi_path_info`, `status_code`, the `CGI_RUNNING`
-bookkeeping (`cgi_out`, `cgi_in_offset`, `cgi_deadline`), and the
-incremental-parsing state added this session (`headers_ready`,
-`body_start`, `chunked_scan_pos` — see Part 1 §2.6–7 for why each exists).
-`try_parse_request`/`handle_request` are declared here since they're the
-shared contract; `CGI_RUNNING` is what lets `handle_request()` leave a
-connection mid-flight instead of always finishing synchronously, so CGI
-can share the one `poll()` loop.
+1. Someone connects and sends it a carefully-formatted piece of text.
+2. It reads that text, figures out what's being asked for.
+3. It sends back another carefully-formatted piece of text as a reply.
+4. Repeat, for potentially thousands of people, all at once.
 
-**`Config.hpp`** — a forwarding shim to `srcs/config/Config.hpp` (kept so
-any code, on either side, that still includes it bare from `include/`
-keeps compiling unchanged).
+That's it. There's no magic. The "carefully-formatted piece of text" in
+step 1 and step 3 is HTTP — a plain-text protocol, which means if you
+squint, an HTTP request looks almost like an email:
+
+```
+GET /index.html HTTP/1.1
+Host: localhost
+User-Agent: curl/8.4.0
+Accept: */*
+
+```
+
+That's a **real, complete, valid HTTP request** — the kind a browser sends
+every time you load a page. Four lines: a "request line" saying what's
+wanted, a few headers giving context, and a blank line marking the end.
+Nothing here is encrypted, compressed, or binary. You could type this by
+hand into a raw TCP connection (with `telnet` or `nc`) and a real server
+would answer you.
+
+**Analogy: the post office.** Think of an HTTP request as a letter you drop
+in a mailbox. The first line is the address on the envelope ("GET
+/index.html" — deliver *this specific thing*, using *this specific
+action*). The headers are the extra notes stapled to the envelope ("also,
+here's who I am, here's what languages I speak, here's a cookie you gave me
+last time"). The blank line is where the letter itself starts, if there is
+one. The server is the post office: it reads the envelope, decides which
+department handles it, and eventually mails a reply letter back — which
+looks exactly the same, just starting with a status line instead of a
+request line:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 137
+
+<html>...</html>
+```
+
+Everything this document covers is really just: **how do we read that
+envelope correctly, and how do we decide what to write back?**
+
+---
+
+# Chapter 1 — Why you can't just `read()` a request and be done
+
+If HTTP requests are just text, why is `srcs/http/RequestParser.cpp` nearly
+350 lines long? Why not just call `read()` once and parse the string?
+
+Because of two inconvenient facts about real networks:
+
+**Fact 1 — TCP has no idea where one request ends and the next begins.**
+A TCP connection is just a stream of bytes, like a garden hose. When a
+browser sends a request, those bytes might arrive at the server in one
+single `read()`, or in five separate `read()` calls, each with a random
+number of bytes, with pauses in between (a slow phone connection, a big
+file upload, whatever). The server has to keep calling `read()`, keep
+appending whatever comes in, and keep *asking itself* — "do I have a
+complete request yet, or should I wait for more?" — until the answer is
+yes.
+
+**Analogy: reading a letter through a mail slot, one page at a time.**
+Imagine someone is feeding a multi-page letter through your door's mail
+slot, one page every few seconds, in no guaranteed rhythm. You can't just
+grab the first page and start replying — you have to keep watching the
+slot, collecting pages, and checking after each one: "does what I have so
+far actually make a complete letter?" Only once you see the letter's own
+"the end" marker do you know it's safe to act.
+
+**Fact 2 — the server is doing this for hundreds of people at once, and
+can't afford to wait around for any single one of them.** This is where
+William's `poll()` loop comes in (briefly, for context — it's not this
+module's code): instead of one dedicated employee per visitor who blocks
+everything else while waiting for that one visitor's next page, there's
+*one* employee who checks a big board of "who has something new to hand me
+right now" (`poll()`), handles whoever's ready, and immediately moves on.
+Nobody's `read()` call is ever allowed to sit and block waiting for bytes
+that haven't arrived yet — that would freeze the one employee for
+everyone else.
+
+The consequence for this module's code: **`try_parse_request()` in
+`srcs/http/RequestParser.cpp` is not a function that runs once per
+request.** It's a function that gets called *again every single time a new
+chunk of bytes arrives* for a connection, and its whole design revolves
+around answering one question fast: "is a complete request sitting in
+`conn.read_buffer` yet, or not?"
+
+```cpp
+bool try_parse_request(Connection& conn);
+```
+
+Return `false` → "not yet, call me again once more bytes show up."
+Return `true` → "done — either I successfully parsed a request, *or* I
+found something so wrong I'm reporting an error status instead. Either
+way, stop calling me for this data and go handle what I found."
+
+That single design decision — *never block, always be interruptible,
+always be resumable* — is the thread that runs through everything in this
+module.
+
+---
+
+# Chapter 2 — Reading a request, one piece at a time
+
+Let's walk through `try_parse_request()` exactly as the code does it,
+explaining every decision.
+
+## 2.1 — First: do we even have the headers yet?
+
+A request has two halves: the **headers** (request line + header lines) and
+the **body** (whatever comes after, like a POST's form data). Headers
+always come first and are always separated from the body by a blank line —
+`\r\n\r\n` per the HTTP spec, though the parser also accepts a bare `\n\n`
+so you can test it by hand with `telnet` without fighting your terminal's
+line endings.
+
+```cpp
+size_t crlf = buf.find("\r\n\r\n");
+size_t lf = buf.find("\n\n");
+```
+
+Until that separator shows up somewhere in `conn.read_buffer`, there is
+*nothing useful to do yet* — we don't even know the method or the URL. So
+the very first check is: "have I found the blank line? If not, and the
+buffer isn't absurdly large yet, just wait for more bytes."
+
+**Why "absurdly large" matters**: an attacker (or a badly-behaved client)
+could just keep sending header bytes forever and never send the blank
+line, trying to make the server hold an ever-growing buffer in memory
+until it runs out. So there's a hard cap —`MAX_HEADER_SECTION = 8192`
+bytes — and if the buffer blows past that with still no blank line in
+sight, the server gives up and answers **`431 Request Header Fields Too
+Large`** instead of waiting forever.
+
+## 2.2 — The request line: method, target, version
+
+Once we have the full header block, the very first line is split into
+exactly three pieces on spaces:
+
+```
+GET /index.html HTTP/1.1
+└┬┘ └────┬─────┘ └──┬───┘
+method  target    version
+```
+
+- **Not exactly three pieces** (extra spaces, missing pieces) → `400 Bad
+  Request`. A request line is a fixed, rigid format; there's no reasonable
+  way to guess what was meant if it doesn't match.
+- **Target doesn't start with `/`** → `400`. This server only understands
+  "origin-form" targets (`/path`), not the full-URL form some proxies use
+  (`http://example.com/path`) — the subject explicitly says only a subset
+  of the RFC needs implementing, and full proxy-style requests are outside
+  that subset.
+- **Version isn't `HTTP/1.0` or `HTTP/1.1`** → `400` if it doesn't even
+  start with `HTTP/`, or **`505 HTTP Version Not Supported`** if it does
+  but names a version we don't speak (`HTTP/2.0`, `HTTP/0.9`, garbage like
+  `HTTP/9.9`).
+- **The target itself is too long** (over 8000 characters) → **`414 URI
+  Too Long`**.
+
+That last one has a subtlety worth calling out: the check for an
+over-length *target* has to happen **before** the general "header section
+is too large" check, not after — otherwise an absurdly long URL would
+always trip the generic 8192-byte cap first and you'd never actually see a
+414, only ever 431. Order of checks matters here, and it's a good example
+of a bug that's invisible until you specifically go looking for it (which
+is exactly how it *was* found, later — see Chapter 10).
+
+## 2.3 — Headers: turning lines into a lookup table
+
+Every line after the request line gets split on its first `:` into a key
+and a value, lower-cased on the key (`Content-Length` and `content-length`
+must be treated identically — HTTP header names are case-insensitive), and
+stored in a `std::map<std::string, std::string>`.
+
+```cpp
+size_t colon = line.find(':');
+if (colon == std::string::npos) {
+    failParse(conn, 400, bodyStart, true);   // "Malformed-Header" with no colon at all
+    return true;
+}
+```
+
+A line with no colon at all isn't a header — it's garbage — so that's a
+`400` too.
+
+**Two specific header rules worth understanding, not just memorizing:**
+
+- **A repeated `Content-Length` with two different values is rejected
+  (`400`).** Why does this matter so much it gets its own check? Because
+  `Content-Length` tells the server exactly how many bytes of body to
+  expect. If a request smuggles in *two different* values for it, and two
+  different pieces of software along the way (say, a proxy and this
+  server) each trust a *different* one of the two, they can end up
+  disagreeing about where the request actually ends — which is exactly how
+  a class of attack called **request smuggling** works: an attacker hides
+  a second, forged request inside what looks like the tail end of a
+  legitimate one, betting that the two systems in the chain will each read
+  the boundary differently. Rejecting outright the moment we see
+  conflicting values closes that door before it opens.
+- **`HTTP/1.1` with no `Host` header → `400`.** `HTTP/1.0` never required
+  one, but `HTTP/1.1` made it mandatory (RFC 7230 §5.4) specifically
+  because a single server can host multiple different sites — `Host` is
+  how the request says *which one it means*. A 1.1 request without it is
+  simply malformed by the spec, not a matter of leniency.
+
+## 2.4 — Caching what we've learned: `headers_ready`
+
+Here's where the "called again and again" nature from Chapter 1 really
+bites. Once headers are successfully parsed, the code sets:
+
+```cpp
+conn.headers_ready = true;
+```
+
+and every *later* call to `try_parse_request()` for this same request
+**skips the entire header-parsing block above** and jumps straight to body
+handling, reading `method`/`path`/`headers`/`body_start` back out of
+`conn` instead of re-deriving them.
+
+This sounds like a micro-optimization. It is not. **This exact caching is
+the fix for a real, serious performance bug** that was found by stress
+testing this server with the official 42 tester: 20 simultaneous clients
+each uploading a 100MB body to a CGI script pegged a CPU core at 100% for
+over nine minutes, with the server barely making progress. The root cause:
+without the cache, the *separator search* from §2.1
+(`buf.find("\r\n\r\n")`) was being run again from scratch on **every single
+`read()`**, over the **entire buffer**, including all the megabytes of
+body that had already arrived. Each new chunk of body meant re-scanning
+everything that came before it too — classic O(n²) behavior, invisible on
+a small test request, catastrophic on a 100MB one.
+
+**Analogy:** imagine re-reading an entire novel from page one, every single
+time someone hands you one more page of it, just to check whether you've
+reached "The End" yet. Fine for a five-page pamphlet. Unusable for a
+thousand-page book. The fix — remembering *where you already checked up
+to* — is `conn.body_start`: computed exactly once, then just read back out
+on every subsequent call.
+
+## 2.5 — Reading the body: two very different philosophies
+
+Once headers are settled, there are two ways a client can tell the server
+how much body to expect, and they represent two genuinely different
+philosophies:
+
+**Content-Length: "here's the total size, up front."**
+```
+Content-Length: 13
+
+Hello, world!
+```
+The client counts its own bytes ahead of time and declares the total. The
+server just waits until it has that many bytes past the blank line, then
+it's done. Simple, but it means the client has to know the full size
+*before* it starts sending — awkward if the body is being generated on the
+fly (say, streaming a file that's still being compressed).
+
+**Transfer-Encoding: chunked — "here's a bit, then another bit, then I'll
+tell you when I'm out."**
+```
+5\r\n
+Hello\r\n
+7\r\n
+, world!\r\n
+0\r\n
+\r\n
+```
+**Analogy: shipping a package in labeled boxes instead of declaring the
+total weight up front.** Each "chunk" starts with its own size (in
+hexadecimal!) on its own line, followed by exactly that many bytes of data,
+followed by `\r\n`. When a chunk announces size `0`, that's the sender
+saying "that was the last box — nothing more is coming." This lets the
+client start sending before it knows the final total size at all.
+
+`request_parser::decodeChunked()` walks this format one chunk at a time,
+and — just like `body_start` above — it **resumes from where it left off**
+via `conn.chunked_scan_pos` instead of re-decoding every previously-seen
+chunk on each call. This was the *other* half of that same O(n²) bug: the
+chunked decoder was originally re-copying the entire body-so-far into
+`conn.body` on every partial read too. Same disease, same cure: cache the
+position, never redo already-finished work.
+
+Whichever method is used, the result is checked against
+`client_max_body_size` (the server's configured limit, or a more specific
+one set on the matched location) — too big → **`413 Payload Too Large`**.
+No `Content-Length` and no chunked encoding at all just means a body of
+zero bytes, which is perfectly normal (most `GET` requests have no body)
+and not an error.
+
+## 2.6 — Never throwing: `failParse()`
+
+Every single rejection path above — bad request line, bad version, huge
+header, huge body, whatever — funnels through one function:
+
+```cpp
+void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn);
+```
+
+It sets `conn.status_code`, trims the bad bytes out of the buffer, and
+optionally marks the connection for closing afterward — and that's it. It
+never throws an exception, never calls `abort()`, never lets a malformed
+request take the whole process down. **A broken request from one client is
+just data to reject, not a crisis.** This one small design rule is a big
+part of *why* this server survives being thrown genuinely garbage input —
+covered concretely in Chapter 10.
+
+---
+
+# Chapter 3 — Routing: turning a URL into "what do I do now?"
+
+Once `try_parse_request()` says "done," control passes to
+`handle_request()` in `srcs/http/RequestHandler.cpp` — the function that
+decides what the response actually *is*.
+
+## 3.1 — Server blocks and location blocks
+
+The config file (Chapter 8 covers its full syntax) describes one or more
+`server { ... }` blocks, each listening on its own `host:port`, and inside
+each one, a set of `location { ... }` blocks — one per URL prefix the
+server should know how to handle.
+
+**Analogy: a company directory.** A `server{}` block is like one building
+(one address). Each `location{}` inside it is like a department sign in
+the lobby: "`/billing` → third floor," "`/support` → second floor," "`/` →
+front desk (handles anything nobody else claimed)." When a request comes
+in for `/support/tickets/42`, the routing logic looks for the *most
+specific* sign that matches — `/support` beats the generic `/` — exactly
+like you'd follow the most specific department sign rather than defaulting
+to the front desk. This is called **longest-prefix matching**, and it's
+implemented in `ServerConfig::matchLocation()`:
+
+```cpp
+if (matches && p.size() >= bestLen) {
+    bestLen = p.size();
+    best = &locations[i];
+}
+```
+
+Every location whose prefix matches the request path is a candidate;
+whichever candidate's prefix is *longest* wins.
+
+## 3.2 — What a location can say about a route
+
+Each `location{}` block can carry any combination of these settings (all
+parsed by `Config::load()` in `srcs/config/Config.cpp`):
+
+- **`root <dir>`** — the filesystem directory this location's files live
+  under. Requests are mapped onto it *alias-style*: whatever's left of the
+  URL after the location's own prefix gets appended straight onto `root`.
+  The subject gives the canonical example: if `/kapouet` is rooted at
+  `/tmp/www`, then `/kapouet/pouic/toto/pouet` resolves to
+  `/tmp/www/pouic/toto/pouet` — the `/kapouet` part is *replaced* by the
+  root, not nested inside it. `joinPath()` implements exactly this.
+- **`index <file>`** — if the request resolves to a *directory*, serve this
+  file from inside it instead of a listing (like nginx's/Apache's
+  `index.html` default).
+- **`autoindex on|off`** — if there's no matching `index` file (or none was
+  configured), should the server generate an HTML directory listing
+  instead of just giving up?
+- **`methods GET POST ...`** — the whitelist of HTTP methods this route
+  will accept. Anything else gets rejected (details in §3.4).
+- **`return <code> <target>`** — an unconditional redirect: the server
+  never even looks at the filesystem for this location, it just answers
+  immediately with the given status code and a `Location:` header pointing
+  at `target`.
+- **`upload_store <dir>`** — turns this location into one clients can
+  `POST` files to, and says *where on disk* uploaded bodies get written.
+- **`cgi <ext> <interpreter>`** — maps a file extension (`.py`, `.sh`, ...)
+  to the program that should execute matching files (Chapter 6 covers this
+  whole mechanism).
+- **`client_max_body_size <bytes>`** — a per-location override of the
+  server-wide body size limit, for routes that need a tighter (or looser)
+  cap than the rest of the site.
+- **`error_page <code> <path>`** — a custom error page for this location
+  specifically, checked *before* falling back to the server-wide one (see
+  §5.2).
+
+## 3.3 — The decision tree, in order
+
+Here's the exact sequence `handle_request()` walks through for every
+request, and the reasoning behind each step:
+
+1. **Was there already a parse error?** (`conn.status_code != 0`, set back
+   in Chapter 2) — if so, skip everything below and just write that error.
+   No point routing a request we already know is broken.
+2. **Find the matching location.** No match at all → **`404 Not Found`**
+   immediately — there's genuinely nothing configured to answer this URL.
+3. **Is this a redirect location?** (`return` was set) — answer with the
+   configured code and stop. Nothing filesystem-related happens for a pure
+   redirect.
+4. **Is the method allowed here?** — covered in detail next (§3.4).
+5. **Reject directory traversal.** Before touching the filesystem *at all*,
+   the remainder of the path is checked for a literal `..` segment. This
+   is the guard against a request like `/files/../../../etc/passwd` trying
+   to walk *outside* the directory it was given access to.
+   **Analogy: a visitor badge that only opens doors on one floor.** Even if
+   someone tries to walk into the stairwell and go up or down, the badge
+   just doesn't work there. The check happens *before* any `stat()` or
+   `open()` call, so a traversal attempt never even reaches the real
+   filesystem.
+6. **Branch on the method** — `DELETE`, CGI, `POST`, or fall through to
+   `GET`-style static serving. Each is its own chapter/section below.
+
+## 3.4 — Method checking, and a subtlety worth understanding: 405 vs. 501
+
+If the resolved method isn't in the location's allowed list, something has
+to be rejected — but *which* status code is correct depends on a
+distinction that's easy to miss:
+
+- **`405 Method Not Allowed`** means: "I recognize this method just fine,
+  it's simply not permitted *here*." A `DELETE` on a read-only route.
+- **`501 Not Implemented`** means: "I don't know what this method even
+  *is*, anywhere on this server." A request using `PROPFIND`, or someone
+  typing garbage like `BLARGH / HTTP/1.1`.
+
+The code keeps a small whitelist of methods it actually recognizes as real
+HTTP methods (`GET`, `POST`, `DELETE`, `HEAD`, `PUT`, `OPTIONS`, `PATCH`) —
+`isKnownMethod()` in `RequestHandler.cpp`. Anything **not** on that list
+gets `501` immediately, regardless of what any location's `methods`
+directive says. Anything that **is** on the list, but just isn't in *this*
+location's allowed set, gets the more specific `405`, along with an
+`Allow:` header listing what actually *is* permitted — which is itself a
+spec requirement (RFC 7231 §6.5.5), not just a nicety.
+
+---
+
+# Chapter 4 — Serving static files, directories, uploads, and deletes
+
+Once a request has passed routing and method checks, `handle_request()`
+does one `stat()` on the resolved filesystem path and branches on the
+method:
+
+## 4.1 — `DELETE`
+
+Straightforward, but every edge case is checked in order: file doesn't
+exist → `404`; it's a directory (deleting a whole directory isn't
+supported) → `403`; `std::remove()` fails for some other reason
+(permissions, etc.) → `403`; otherwise → **`204 No Content`** — the correct
+response for "the thing you asked me to do is done, and there's nothing
+useful to send back."
+
+## 4.2 — `POST` (uploads)
+
+If the matched location has no `upload_store` configured, the server
+still accepts the request with a plain `200` — it's legitimate for a route
+to accept a `POST` it doesn't need to persist anywhere (a contact form
+that just emails itself, for instance, in spirit — this project doesn't
+send email, but the *shape* of "accept data, don't necessarily store a
+file" is valid). If `upload_store` *is* configured, the body is written to
+disk under that directory (inventing a filename from the current time and
+the connection's own fd if the URL didn't supply one) and the server
+answers **`201 Created`** with a `Location:` header pointing at the new
+resource — the standard way to tell a client "here's where what you just
+sent now lives."
+
+## 4.3 — `GET` (and the fall-through case for everything else)
+
+- **Nothing exists at the resolved path** → `404`.
+- **It's a directory, and the URL didn't end in `/`** → **`301 Moved
+  Permanently`** redirecting to the same URL *with* a trailing slash.
+  **Why this matters, concretely:** a browser resolves *relative* links
+  (`<a href="style.css">`) against the current URL. If the server served
+  the directory's content directly at `/blog` (no slash), a relative link
+  to `style.css` would resolve to `/style.css` — wrong. Redirecting to
+  `/blog/` first means every relative link inside the page resolves
+  correctly afterward. This is the same behavior nginx and Apache both
+  have, for the same reason.
+- **It's a directory, and the URL *does* end in `/`** — look for the
+  location's configured `index` file inside it and serve that if it
+  exists; otherwise, if `autoindex` is on, generate a directory listing
+  page; otherwise, `404` (deliberately `404`, not `403` — from the
+  client's point of view, there's simply nothing to see here, which is a
+  more honest answer than "you're not allowed").
+- **It's a regular file** → read the whole thing and serve it, with a
+  guessed `Content-Type` (`HttpStatus::mimeType()` — a simple
+  extension-to-MIME-type lookup table) and a `Last-Modified` header built
+  from the file's own `stat()` modification time (this is meaningful for a
+  static file with one clear "last changed" moment; CGI output and
+  generated directory listings deliberately don't get one, since neither
+  has a single well-defined modification time — that's a real editorial
+  choice worth naming so it's not mistaken for an oversight).
+
+---
+
+# Chapter 5 — Writing the response, and how errors get their pages
+
+## 5.1 — Building the raw bytes
+
+`writeResponse()` assembles the actual text that goes back over the wire:
+
+```
+HTTP/1.1 200 OK
+Date: Tue, 22 Sep 2026 15:54:23 GMT
+Server: webserv/1.0
+Connection: keep-alive
+Content-Type: text/html
+Content-Length: 5394
+Last-Modified: Tue, 22 Sep 2026 11:40:17 GMT
+
+<!DOCTYPE html>...
+```
+
+Two details worth calling out because they're easy to get subtly wrong:
+
+- **`HEAD` requests get every header a `GET` would, but never the body** —
+  the whole *point* of `HEAD` (RFC 7231) is "tell me what you'd send,
+  without actually sending it," so `Content-Length` still reflects the
+  real size the body *would* have been, it's just never appended to
+  `conn.write_buffer`.
+- **`Connection: keep-alive` vs. `close`** decides whether, once this
+  response finishes sending, the socket stays open waiting for another
+  request on the same connection (much cheaper than opening a new TCP
+  connection per request) or gets closed outright. This is decided back in
+  Chapter 2 from the HTTP version and any `Connection` header the client
+  sent.
+
+## 5.2 — Error pages: a chain of fallbacks
+
+`writeErrorResponse(conn, code, loc)` is what every rejection path in this
+whole module eventually calls. It checks, in order:
+
+1. **Does the *matched location* have a custom `error_page` for this exact
+   code?** If so, and the file's readable, serve it.
+2. **Does the *server block* have one?** Same check, one level less
+   specific.
+3. **Otherwise**, fall back to a minimal built-in HTML page
+   (`HttpStatus::defaultErrorBody()`) — so a server with *zero* error pages
+   configured still never sends back a broken, empty, or confusing
+   response. The subject requires this outright: "Your server must have
+   default error pages if none are provided."
+
+This is a genuinely useful design pattern beyond just this project: **most
+specific setting wins, with a sane universal fallback at the bottom**, so
+nothing ever falls through to "undefined behavior."
+
+## 5.3 — A quick reference: which status code means what, here
+
+| Code | Meaning here |
+|---|---|
+| 200 | OK — normal successful response |
+| 201 | Created — a POST/upload wrote a new file |
+| 204 | No Content — a DELETE succeeded, nothing to send back |
+| 301 | Moved Permanently — `return` redirect, or a directory needing a trailing slash |
+| 302/303/307 | Other `return`-directive redirect flavors |
+| 400 | Bad Request — malformed request line/headers/body framing |
+| 403 | Forbidden — directory traversal attempt, or a filesystem permission failure |
+| 404 | Not Found — no matching location, or nothing at the resolved path |
+| 405 | Method Not Allowed — a real method, just not permitted on this route |
+| 413 | Payload Too Large — body over `client_max_body_size` |
+| 414 | URI Too Long |
+| 431 | Request Header Fields Too Large — too many headers, or the header section itself too big |
+| 500 | Internal Server Error — something failed on *our* side (e.g. couldn't open a file to write an upload) |
+| 501 | Not Implemented — a method this server doesn't recognize at all |
+| 502 | Bad Gateway — a CGI script failed to even start, or crashed with no output |
+| 504 | Gateway Timeout — a CGI script ran past its time limit |
+| 505 | HTTP Version Not Supported |
+
+---
+
+# Chapter 6 — CGI: hiring an outside contractor
+
+This is the most involved part of the module, so it gets the most space.
+CGI (the **Common Gateway Interface**, RFC 3875) is how a web server hands
+a request off to a *completely separate program* — a Python script, a
+shell script, a compiled binary — and gets back a response to forward to
+the client. Think `.py` files that generate a page dynamically, instead of
+serving a fixed `.html` file.
+
+## 6.1 — The core idea: don't talk directly, use mailboxes
+
+**Analogy: hiring an outside contractor who works in a locked room, and
+communicating only via two mail slots.** You don't walk into their room and
+have a conversation — you slide instructions through one slot (their
+"inbox"), and they slide their finished work back through a different slot
+(their "outbox"). This is exactly what a **pipe** is: a one-way tube of
+bytes between two processes. The server opens two of them —
+`conn.cgi_stdin_fd` (our outbox, their inbox) and `conn.cgi_stdout_fd`
+(their outbox, our inbox) — before the contractor even starts working.
+
+## 6.2 — `fork()` + `execve()`: clone yourself, then transform
+
+Starting the contractor is a two-step Unix dance, in `cgi_handler::start()`
+(`srcs/cgi/CgiHandler.cpp`):
+
+```cpp
+pid_t pid = fork();
+```
+
+**`fork()` clones the current process into two identical copies** — same
+code, same memory, same everything, running from the exact same point,
+distinguished only by `fork()`'s own return value (0 in the new child, the
+child's process ID in the original parent). It's less "hiring someone new"
+and more "an office worker suddenly splits into two identical people, and
+one of them immediately walks out the door."
+
+That's why the very next thing the child does, right after `fork()`, is:
+
+```cpp
+execve(interpreter.c_str(), &argv[0], &envp[0]);
+```
+
+**`execve()` replaces the *entire* running program in the child process**
+with a brand new one — the interpreter (`python3`, `/bin/sh`, ...) — while
+keeping the same process ID and the same open file descriptors. That's the
+"immediately transforms into a completely different specialist" half of
+the metaphor: the clone doesn't keep being a copy of the web server, it
+*becomes* the CGI interpreter, argv `[interpreter, scriptPath]`, running
+the requested script as its actual first argument (the subject specifically
+asks for this: "call the CGI with the file requested as the first
+argument").
+
+Before that swap happens, the child:
+- `dup2()`'s the pipe ends onto its own stdin/stdout, so the interpreter
+  reading `stdin`/writing `stdout` is — without knowing it — actually
+  talking through our pipes.
+- `chdir()`'s into the script's own directory, so if the script opens a
+  file using a relative path, it resolves the way the script's author
+  expects, not relative to wherever the web server itself happened to be
+  launched from.
+
+If `execve()` itself fails (bad interpreter path, no permission, ...), the
+child calls `_exit(127)` — `127` being the conventional Unix "command not
+found" exit code, which the parent later checks for specifically (§6.5).
+
+## 6.3 — Telling the contractor what the job is: environment variables
+
+The interpreter that gets `execve()`'d has no idea it's running inside a
+web server, or what the original HTTP request even looked like — unless we
+tell it. That's `buildEnv()`'s whole job: translating the parsed HTTP
+request into a list of `KEY=value` strings the CGI process receives as its
+environment (the same mechanism a shell uses for `$PATH`, `$HOME`, etc.).
+
+**Analogy: a work order form filled out before the contractor starts.**
+Instead of the contractor asking questions, everything they need to know
+is already sitting in labeled fields when they arrive:
+
+| Variable | What it tells the script |
+|---|---|
+| `REQUEST_METHOD` | `GET`, `POST`, `DELETE`, ... |
+| `SCRIPT_NAME` | The URL path up to (and including) the script itself |
+| `SCRIPT_FILENAME` | The real filesystem path of the script |
+| `PATH_INFO` | Anything *after* the script in the URL (see §6.4) |
+| `QUERY_STRING` | Everything after the `?` in the URL |
+| `CONTENT_LENGTH` / `CONTENT_TYPE` | Size and type of the request body, if any |
+| `SERVER_PROTOCOL` | `HTTP/1.1` or `HTTP/1.0` |
+| `SERVER_NAME` / `SERVER_PORT` | Which server block, which port |
+| `REQUEST_URI` | The full original path + query string |
+| `HTTP_<HEADER_NAME>` | **Every** request header, individually, uppercased with dashes turned to underscores (`Accept-Language` becomes `HTTP_ACCEPT_LANGUAGE`) — this is how a script reads cookies, auth tokens, content negotiation headers, anything the client sent |
+
+That last one is the loop at the bottom of `buildEnv()` — it walks every
+header the client sent (except `Content-Length`/`Content-Type`, which
+already got their own dedicated variables) and re-exposes each one, which
+is exactly what the CGI/1.1 spec requires: *"The full request and
+arguments provided by the client must be available to the CGI,"* as the
+subject itself puts it.
+
+## 6.4 — `SCRIPT_NAME` vs. `PATH_INFO`: splitting a URL in two
+
+A URL like `/cgi-bin/gallery.py/vacation/beach.jpg` is ambiguous on
+purpose: is `gallery.py` the script, with `/vacation/beach.jpg` as extra
+information for it to interpret (say, a photo gallery script using the
+"path" as which album/photo to show)? RFC 3875 says yes — this is exactly
+what `PATH_INFO` is for.
+
+`resolveCgiScript()` (`RequestHandler.cpp`) walks the URL one `/`-segment
+at a time, checking at each boundary whether *that much* of the path
+resolves to a real file with a configured CGI extension. The first one it
+finds *is* the script; everything after it becomes `PATH_INFO`. Once
+found, `buildEnv()` splits the two apart:
+
+```cpp
+std::string scriptName = conn.path;
+if (!conn.cgi_path_info.empty() && conn.cgi_path_info.size() <= scriptName.size())
+    scriptName.erase(scriptName.size() - conn.cgi_path_info.size());
+```
+
+`SCRIPT_NAME` = `/cgi-bin/gallery.py`, `PATH_INFO` = `/vacation/beach.jpg`
+— exactly the split the script expects to receive.
+
+## 6.5 — Not waiting around: pipes join the same `poll()` everyone else uses
+
+This is the part that ties CGI back into Chapter 1's central rule: **never
+block, ever.** A CGI script could be instant, or it could take ten
+seconds, or it could hang forever. The server can't afford to sit and wait
+on any one of those possibilities while every other client goes unanswered.
+
+So the two pipe file descriptors get registered into the *exact same*
+`poll_fds` array as every listening socket and every client socket (this
+is William's registry code, but it's what makes the next part possible).
+When `poll()` reports the CGI's stdin pipe is ready to accept more bytes,
+`onStdinWritable()` writes one chunk of the request body into it. When it
+reports the stdout pipe has data ready to read, `onStdoutReadable()` reads
+one chunk of the script's output. Neither function ever blocks waiting —
+they only ever act *after* `poll()` has already said "this is ready right
+now."
+
+```cpp
+void onStdinWritable(Connection& conn) {
+    ...
+    ssize_t n = write(conn.cgi_stdin_fd, ...);
+    ...
+}
+```
+
+This is a direct, literal implementation of "the contractor's mail slots
+get checked on the same rounds as everyone else's" — the CGI pipes aren't
+a special case requiring their own separate waiting loop; they're just two
+more entries on the one big board everything else already uses.
+
+## 6.6 — Knowing when the contractor is actually finished
+
+A pipe closing (both fds hitting `-1`, `isDone()`) only means the script
+has stopped talking — it doesn't yet say whether the script *succeeded*.
+That's what `finish()` figures out with one non-blocking `waitpid()` call,
+checking the child's real exit status:
+
+- **Exited with status 127** (the "command not found" convention from
+  §6.2) → the interpreter itself never even started → **`502 Bad
+  Gateway`**.
+- **Killed by a signal** (a segfault, for instance) *and* produced no
+  output → also **`502`** — something genuinely broke, and there's nothing
+  usable to send back.
+- **Otherwise** — even a script that exits with a nonzero status but *did*
+  print a valid response — its output is trusted and forwarded as-is via
+  `finishFromCgiOutput()`. A CGI script's own **`Status:`** header (if it
+  wrote one) becomes the actual HTTP status code of the response; its own
+  `Content-Type:` header is honored too. This lets a script override the
+  default `200` when it needs to — a script can literally say "actually,
+  answer this with a 226" and the server will.
+
+**A subtlety that took real debugging to get right:** a child process's
+pipes closing, and that same child becoming *reapable* via `waitpid()`, are
+**two separate events from the kernel's point of view**, and they don't
+necessarily happen in the same instant. Calling `waitpid()` immediately
+after seeing both pipes close can, some of the time, come back empty —
+"not ready yet" — even though the script is about to be reapable a moment
+later. Getting this wrong (assuming "pipes closed" always means "ready to
+reap") caused a **real bug**: roughly 1 in 3 CGI requests would get
+misreported as a plain `200` when they should have been a `502`, because
+the code guessed instead of checking. The fix is exactly what you'd expect
+once you see the race clearly: `finish()` returns `false` ("not ready,
+don't change anything") instead of guessing, and the caller just tries
+again on the next `poll()` iteration.
+
+## 6.7 — Firing a contractor who's taking too long
+
+Every CGI gets a 10-second deadline (`conn.cgi_deadline`,
+`CGI_TIMEOUT_SECONDS`). If a script is still running when that deadline
+passes, `abortTimeout()` sends it `SIGKILL` and answers the original
+client with **`504 Gateway Timeout`** — and critically, *this happens
+without freezing anything else the server is doing*. A hung CGI script on
+one connection has zero effect on any other connection's requests, which
+was verified directly: with one client's request stuck behind a
+deliberately-hanging CGI script, a second, unrelated client's plain `GET /`
+completed in well under a millisecond while the first was still waiting
+out its timeout.
+
+## 6.8 — Cleaning up after: avoiding zombie processes
+
+A child process that has exited but hasn't been "acknowledged" via
+`waitpid()` yet lingers in the operating system's process table as a
+**zombie** — not doing anything, but still taking up a slot, forever, until
+something reaps it. Left unchecked across thousands of requests, that's a
+slow leak that will eventually exhaust the system.
+
+The fix here is `reapIfExited()`, called opportunistically every loop
+iteration for any pid still owed a reap — always with `WNOHANG`, so it
+never blocks waiting for a process that isn't ready yet. Note also what
+this code deliberately **never** does: call `waitpid(-1, ...)`, which means
+"reap *anything* that's exited, I don't care which pid." With several CGI
+children potentially in flight for different clients simultaneously, that
+call could reap the *wrong* child and steal another connection's exit
+status out from under it. Every reap here names its exact pid.
+
+---
+
+# Chapter 7 — The configuration file: teaching the server without recompiling it
+
+## 7.1 — Turning text into structure
+
+`Config::load()` (`srcs/config/Config.cpp`) reads the whole config file
+into memory and processes it in two passes:
+
+1. **Tokenize** — walk the raw text once, character by character, splitting
+   it into a flat list of words. `{` and `}` are always their own token
+   (even with no space around them); a `#` starts a comment that runs to
+   the end of the line; everything else is split on whitespace.
+2. **Parse** — walk that token list expecting a specific shape: zero or
+   more `server { ... }` blocks at the top level, each containing
+   directives and `location { ... }` blocks, each of *those* containing
+   its own directives (Chapter 3.2 covers what each directive means).
+
+**A deliberate design choice worth naming:** an unrecognized directive, or
+one with a malformed value, makes `Config::load()` `throw`. It's caught in
+`main()` and turned into a clean startup failure with an error message —
+never a crash, but also never a silent "I'll just ignore what I don't
+understand and keep going." A typo in the config file should be loud and
+obvious the moment you try to start the server, not a mystery you discover
+during a live evaluation when some route just doesn't behave as expected.
+
+## 7.2 — A real example, annotated
+
+```conf
+server {
+    listen 127.0.0.1:8080
+    server_name localhost
+    client_max_body_size 1048576
+    error_page 404 www/errors/404.html
+
+    location / {
+        root www
+        index index.html
+        methods GET
+        autoindex off
+    }
+
+    location /cgi-bin {
+        root www/cgi-bin
+        methods GET POST
+        cgi .py /usr/bin/python3
+    }
+
+    location /upload {
+        root www/upload
+        methods GET POST DELETE
+        upload_store www/upload
+        autoindex on
+    }
+}
+```
+
+Read top to bottom: this server listens on `127.0.0.1:8080`, allows up to
+1MB request bodies by default, and shows `www/errors/404.html` for any
+`404`. The root `/` serves static files out of `www/`, GET-only, no
+directory listing. `/cgi-bin` allows GET and POST, and treats any `.py`
+file under it as a script to run through `/usr/bin/python3`. `/upload`
+allows the full GET/POST/DELETE lifecycle and writes uploaded files into
+`www/upload`.
+
+---
+
+# Chapter 8 — One request, start to finish
+
+Let's tie every chapter together by narrating one concrete request all the
+way through: a browser loading `http://localhost:8080/cgi-bin/hello.py?name=webserv`.
+
+1. **The bytes arrive.** William's `poll()` loop sees the client socket is
+   readable, calls `read()`, appends whatever came in to
+   `conn.read_buffer`, and calls `try_parse_request(conn)`.
+2. **Headers aren't ready yet the first time through.** The parser looks
+   for `\r\n\r\n`. If the whole request arrived in one `read()` (likely,
+   for something this small), it's found immediately.
+3. **The request line is split**: method `GET`, target
+   `/cgi-bin/hello.py?name=webserv`, version `HTTP/1.1`. Version is
+   recognized, target starts with `/` and isn't over-length — no rejection
+   yet.
+4. **The target is split on `?`**: path `/cgi-bin/hello.py`, query string
+   `name=webserv`.
+5. **Headers are parsed** into the lower-cased map — `Host`, `User-Agent`,
+   `Accept`, etc. `Host` is present, so the `HTTP/1.1`-requires-`Host`
+   check passes.
+6. **No `Content-Length`, no `Transfer-Encoding`** — this is a `GET`, no
+   body expected. `conn.body` stays empty.
+7. **`try_parse_request()` returns `true`.** `handle_request(conn)` is
+   called.
+8. **Routing**: `matchLocation("/cgi-bin/hello.py")` finds the `/cgi-bin`
+   location (longest matching prefix). It has no `return`, and `GET` is in
+   its allowed methods, so we continue.
+9. **Traversal guard**: the remainder of the path (`/hello.py`) has no
+   `..` segment. Safe to proceed.
+10. **`stat()`** finds `www/cgi-bin/hello.py` exists and is a regular file.
+    Its extension (`.py`) is in the location's `cgi_extensions` map →
+    **this is a CGI request.**
+11. **`cgi_handler::start()`** opens two pipes, `fork()`s, and in the
+    child: `dup2()`s the pipes onto stdin/stdout, `chdir()`s into
+    `www/cgi-bin`, and `execve()`s `/usr/bin/python3` with `hello.py` as
+    its argument and a full CGI/1.1 environment (`REQUEST_METHOD=GET`,
+    `QUERY_STRING=name=webserv`, `SCRIPT_NAME=/cgi-bin/hello.py`, every
+    `HTTP_*` header, ...). `conn.state` becomes `CGI_RUNNING`.
+12. **The body is empty**, so there's nothing to write to the script's
+    stdin — `conn.cgi_stdin_fd` is immediately closed and marked `-1`.
+13. **A few milliseconds later**, `poll()` reports the script's stdout pipe
+    is readable. `onStdoutReadable()` reads the script's printed HTML into
+    `conn.cgi_out`. This might take one read or several, depending on how
+    much the script prints and how the kernel buffers it — each one just
+    appends to `conn.cgi_out`.
+14. **The script exits, its stdout pipe closes.** `isDone()` is now true.
+    `finish()` calls `waitpid()`, sees a normal exit (not 127, not
+    signaled), and calls `finishFromCgiOutput()`, which finds the script's
+    own `Content-Type: text/html` header, and forwards everything after
+    the blank line as the body.
+15. **`writeResponse()`** assembles the final bytes: status line, `Date`,
+    `Server`, `Connection`, `Content-Type`, `Content-Length`, and the
+    script's HTML body.
+16. **William's loop flips the socket to `POLLOUT`**, and once `poll()`
+    says it's writable, sends the response — possibly across several
+    `write()` calls for a larger page, each one only happening after
+    `poll()` confirms the socket is ready.
+17. **If the connection is keep-alive**, this module's per-request state
+    (`headers_ready`, `body_start`, `chunked_scan_pos`) is reset, and the
+    server immediately checks whether a *second* request is already
+    sitting in the buffer (a browser might have pipelined one). If not, it
+    goes back to waiting for more bytes on the next `poll()` — ready to
+    start this whole story over again.
+
+---
+
+# Appendix A — File-by-file map
+
+### `include/` — the shared contract with William's Core Server
+
+**`connection.hpp`** — the `Connection` struct and `ConnState` enum
+(`READING_REQUEST → PROCESSING → (CGI_RUNNING) → WRITING_RESPONSE → DONE`),
+shared by both halves. Fields this module owns: `method`, `path`,
+`http_version`, `headers`, `body`, `query_string`, `cgi_path_info`,
+`status_code`, the whole CGI bookkeeping group (`cgi_stdin_fd`,
+`cgi_stdout_fd`, `cgi_pid`, `cgi_out`, `cgi_in_offset`, `cgi_deadline`),
+and the incremental-parsing cache (`headers_ready`, `body_start`,
+`chunked_scan_pos` — Chapter 2.4/2.5). `try_parse_request()` and
+`handle_request()` are declared here since they're the entire contract
+between the two halves of the project.
+
+**`Config.hpp`** — a forwarding shim to `srcs/config/Config.hpp`.
 
 ### `srcs/http/` — request parsing and routing
 
-**`RequestParser.hpp`/`.cpp`** — `try_parse_request()` (Part 1 §2) and
-`request_parser::decodeChunked()`, plus file-local `findHeaderEnd()`,
-`collapseSlashes()`, `failParse()`.
+**`RequestParser.hpp`/`.cpp`** — `try_parse_request()` (Chapter 2),
+`request_parser::decodeChunked()`, and the file-local helpers
+`findHeaderEnd()`, `collapseSlashes()`, `failParse()`.
 
-**`RequestHandler.hpp`/`.cpp`** — `handle_request()` (Part 1 §3),
-`writeResponse()`/`writeErrorResponse()` (exposed so `CgiHandler.cpp` can
-produce error pages identical to every other error path), and the routing
-helpers: `joinPath()` (alias-style root+rel joining, matching the
-subject's own `/kapouet` example), `hasDotDotSegment()`,
-`extensionOf()`/`basenameOf()`, `resolveCgiScript()` (the
-`PATH_INFO`-aware CGI lookup), `serveFile()`, `serveAutoindex()`.
+**`RequestHandler.hpp`/`.cpp`** — `handle_request()` (Chapters 3–5),
+`writeResponse()`/`writeErrorResponse()` (also called from
+`CgiHandler.cpp`, so CGI error pages look identical to every other error
+path), and the routing helpers: `joinPath()`, `hasDotDotSegment()`,
+`extensionOf()`/`basenameOf()`, `resolveCgiScript()` (Chapter 6.4),
+`serveFile()`, `serveAutoindex()`, `isKnownMethod()` (Chapter 3.4),
+`formatHttpDate()`/`httpDate()` (Chapter 5.1).
 
 **`HttpStatus.hpp`/`.cpp`** — `reasonPhrase()`, `defaultErrorBody()`,
-`mimeType()`. Tiny, stateless lookup helpers.
+`mimeType()`. Small, stateless lookup tables.
 
-### `srcs/cgi/` — CGI execution
+### `srcs/cgi/` — CGI execution (Chapter 6)
 
-**`CgiHandler.hpp`/`.cpp`** — the full CGI interface (Part 1 §4b):
-`start()`, `onStdinWritable()`/`onStdoutReadable()`, `isDone()`,
-`finish()`, `abortTimeout()`, `reapIfExited()`, plus file-local
-`splitDirFile()`, `parentPath()`, `buildEnv()` (the full CGI/1.1
-environment — `REQUEST_METHOD`, `SCRIPT_NAME`/`PATH_INFO` split,
-`SCRIPT_FILENAME`, `QUERY_STRING`, `CONTENT_LENGTH`/`CONTENT_TYPE`,
-`SERVER_*`, `REQUEST_URI`, `REMOTE_ADDR`, `PATH`, and every request header
-as `HTTP_*`), and `finishFromCgiOutput()` (parses the CGI's own
-`Status:`/`Content-Type:` headers out of its stdout).
+**`CgiHandler.hpp`/`.cpp`** — `start()`, `onStdinWritable()`/
+`onStdoutReadable()`, `isDone()`, `finish()`, `abortTimeout()`,
+`reapIfExited()`, plus the file-local `splitDirFile()`, `parentPath()`,
+`buildEnv()`, `finishFromCgiOutput()`.
 
-### `srcs/config/` — configuration
+### `srcs/config/` — configuration (Chapter 7)
 
-**`Config.hpp`/`.cpp`** — `Location` (one route's config) and
-`ServerConfig` (one `server{}` block) structs, `Location::methodAllowed()`,
-`ServerConfig::matchLocation()`, and the config-file parser:
-`tokenize()` (whitespace/`{}`/`#`-comment tokenizer), `parseLocation()`,
-`parseServer()`, `Config::load()`. Every directive the config format
-supports (`listen`, `server_name`, `client_max_body_size`, `error_page`,
-`root`, `index`, `autoindex`, `methods`, `return`, `upload_store`, `cgi`,
-and a location-level `client_max_body_size` override) is a branch in
-`parseLocation()`/`parseServer()`; an unknown directive or malformed value
-throws, never crashes.
+**`Config.hpp`/`.cpp`** — `Location` and `ServerConfig` structs,
+`Location::methodAllowed()`, `ServerConfig::matchLocation()`, and the
+parser itself: `tokenize()`, `parseLocation()`, `parseServer()`,
+`Config::load()`.
 
 ### `srcs/utils/` — shared helpers
 
 **`StringUtils.hpp`/`.cpp`** — `trim`, `toLower`/`toUpper`, `split`,
-`startsWith`, `toString` (long/size_t → string, since C++98 has no
-`std::to_string`), `toLong` (strict, no `strtol` trailing-garbage
-tolerance), `urlDecode`, `headerKeyToEnv`. The small building blocks
-everything else is written in terms of. Nothing here does heap allocation
-beyond ordinary `std::string`/`std::vector` growth — consistent with the
-whole module having zero `new`/`malloc`/`calloc` calls.
+`startsWith`, `toString`, `toLong`, `urlDecode`, `headerKeyToEnv`. The
+small building blocks everything above is written in terms of. Nothing
+here allocates on the heap beyond ordinary `std::string`/`std::vector`
+growth — this module has zero `new`/`malloc`/`calloc` calls anywhere.
 
 ### `conf/` — configuration files
 
 **`default.conf`** — used when `webserv` is launched with no argument.
-Same site as `test.conf`'s first `server{}` block, listening on
-`0.0.0.0:8080`.
 
-**`test.conf`** — the main demo config, two `server{}` blocks:
-- `:8080` — the real site (`www/`): static `/`, autoindex on `/listing`,
-  a `301` (`/old`) and a `302` (`/moved`) redirect, `/cgi-bin` (Python
-  `.py` scripts plus a deliberately-broken `.broken` extension mapped to
-  a nonexistent interpreter, for exercising `502` on demand), and
-  `/upload` (GET/POST/DELETE, uploads land in `www/upload`).
-- `:8081` — a genuinely different site (`www/site2/`), with a 10-byte
-  `client_max_body_size` to demonstrate per-server body limits and `413`.
+**`test.conf`** — the main demo config: two `server{}` blocks, one real
+site on `:8080` (static serving, autoindex demo, redirects, CGI, uploads)
+and a genuinely separate second site on `:8081` with a deliberately tiny
+10-byte body limit, to demonstrate `413` on demand.
 
-**`tester.conf`** — config for the official 42 `tester` Go binary.
-Routes match exactly what that tool's interactive prompts demand: `/`
-GET-only, `/directory/` aliasing the `YoupiBanane` fixture (POST + `.bla`
-CGI mapping included, since the tester exercises that combination there
-too, not just at `/youpi.bla`), `/youpi.bla` as an exact-path CGI location
-(root pointed at the file itself, not its directory), and `/post_body`
-with a location-level `client_max_body_size 100` (the tester's own stated
-requirement). The `.bla` extension maps to `../../cgi_tester` — relative,
-not a hardcoded personal path: the CGI child `chdir()`s into
-`www/YoupiBanane` before `execve()`, and `execve()` never does a `PATH`
-search, so this resolves correctly on any machine once the official
-`cgi_tester` binary is dropped at the repo root.
+**`tester.conf`** — config shaped to match the official 42 `tester` Go
+binary's exact, stated requirements (Chapter 9 of the eval process).
 
 ### `www/` — the site itself
 
-Static site (`index.html`, `about.html`, `dashboard.html`, `styles.css`)
-plus fixtures: `cgi-bin/` (Python scripts covering GET/POST CGI,
-`PATH_INFO`, a deliberately hanging/slow script, and a script-that-isn't
-for exercising `502`), `errors/404.html` (custom error page), `listing/`
-(autoindex demo files), `upload/` + `site2/uploads/` (runtime upload
-targets, empty in git via `.gitkeep`), `site2/` (the distinct second site
-on `:8081`), and `YoupiBanane/` (fixture layout the official 42 `tester`
-binary's setup instructions demand).
+Static pages, `cgi-bin/` fixture scripts (GET/POST CGI, `PATH_INFO`, a
+deliberately hanging script, a script-that-isn't for exercising `502`),
+`errors/404.html`, `listing/` (autoindex demo files), upload targets, a
+second distinct site (`site2/`), and the `YoupiBanane/` fixture the
+official tester's setup instructions require.
 
 ---
 
-## Part 3 — What's been verified
+# Appendix B — Real bugs found, and how
+
+This project's correctness wasn't established by "it compiled and curl
+looks right" — it was established by throwing real, adversarial, and
+high-volume traffic at it and watching what broke. Some of what that
+process actually found, because seeing *real* bugs and their fixes is
+often more instructive than any amount of clean-path explanation:
+
+- **`HEAD` responses were leaking a body** (a real RFC 7231 violation) —
+  fixed in `writeResponse()`.
+- **No trailing-slash redirect for directories** — fixed in
+  `matchLocation()`/`handle_request()` (Chapter 4.3).
+- **A genuine race in `finish()`** between a CGI child's pipes closing and
+  it becoming reapable, misreporting `502` as `200` roughly 1 in 3
+  requests — fixed by reporting "not ready" instead of guessing (Chapter
+  6.6).
+- **`431` was silently unenforced** for a header section that arrived
+  whole in a single `read()` (only the still-growing case was checked) —
+  and fixing *that* then made `414` unreachable for an overlong URI, which
+  needed its own fix: check the request line's own length before the
+  whole-section length (Chapter 2.2).
+- **`PATH_INFO` (RFC 3875) wasn't implemented at all**, originally — added
+  via `resolveCgiScript()` (Chapter 6.4).
+- **A real O(n²) performance blowup**, found via the official tester's own
+  20-concurrent-100MB-CGI-POST stress case: a CPU core pegged at 100% for
+  over nine minutes with almost no progress. Root cause: both the chunked
+  decoder and the header/body separator search were redoing already-
+  finished work on every partial read instead of resuming from a cached
+  position. Fixed by adding exactly that cache (`chunked_scan_pos`,
+  `body_start` — Chapter 2.4/2.5).
+- **The official 42 `cgi_tester` binary's non-standard `PATH_INFO`
+  expectation**, and **CGI dispatch originally requiring the target file
+  to exist** (it shouldn't, for an interpreter that never touches the
+  filesystem itself) — both found by running the official tester directly
+  and reverse-engineering its exact checks (via `objdump` on the
+  unstripped binary), both fixed in `CgiHandler.cpp`/`RequestHandler.cpp`.
+- **Missing per-location `client_max_body_size`** — the config format
+  originally only supported a server-wide limit, but a real test case
+  needed a route with its own tighter one. Added as a `Location`-level
+  override.
+- **No `Date` header, and no `Last-Modified` header** — both are
+  RFC-expected on ordinary HTTP responses and were simply missing; added
+  once an independent third-party test suite specifically flagged their
+  absence.
+- **No distinction between "unrecognized method" and "recognized but not
+  allowed here"** — everything not on a location's `methods` list was
+  getting a blanket `405`, when an entirely-unknown method should be `501`
+  instead (Chapter 3.4).
+- **A request with both `Content-Length` and `Transfer-Encoding: chunked`
+  was silently resolved by preferring one of the two**, instead of being
+  rejected outright — closed as the classic request-smuggling ambiguity it
+  is (Chapter 2.3).
+
+---
+
+# Appendix C — What's been verified
 
 Beyond ordinary `curl`, this module's behavior has been checked against:
 
-- **A real browser** exercising the dashboard's live test buttons (`fetch()`
-  calls, a real file upload, a real form submission).
+- **A real browser**, driven end-to-end: page rendering, in-page
+  navigation, autoindex listings, CGI over `GET` with a query string, CGI
+  over `POST` via `fetch()`, and an unrecognized-method request — all
+  confirmed correct, with the connection staying healthy afterward (no
+  crash, no hang).
 - **The official 42 `tester` Go binary**, against `conf/tester.conf` + the
   `YoupiBanane` fixture, including its heaviest concurrency case (20
   workers × 5 requests each, 100MB CGI POST per request; 128 concurrent
-  workers hammering a single route): **exits 0, no failures**, against the
-  real integrated `Server` + this module, verified on a real Linux
-  machine. This run is what caught most of the real bugs below.
+  workers hammering a single route): **exits 0, no failures**.
+- **Two independent third-party Python test suites** (not written by
+  anyone on this project), each testing HTTP conformance from a different
+  angle — used specifically to find gaps this project's own tests
+  wouldn't have thought to check, several of which turned into real fixes
+  listed in Appendix B.
 - **`valgrind`**, functional suite + a clean `SIGINT` shutdown: no leaks,
   no invalid-fd reports — consistent with there being no `new`/`malloc`
   anywhere in this module.
 
-Real bugs found this way and fixed, roughly in the order found:
-
-- **HEAD responses leaking a body** (RFC 7231 violation) — fixed in
-  `writeResponse()`.
-- **No trailing-slash redirect for directories** — fixed in
-  `ServerConfig::matchLocation()` + `handle_request()`.
-- **A genuine CGI race** in `finish()` between a child's pipes closing and
-  it becoming reapable, which could misreport `502` as `200` roughly 1 in
-  3 requests — fixed by reporting "not ready" instead of guessing.
-- **`431` silently unenforced** for a header section that arrived whole in
-  a single `read()` (only the still-growing case was checked) — fixed,
-  which then made `414` unreachable for an overlong URI, fixed again by
-  checking the request line's own length first.
-- **`PATH_INFO` (RFC 3875)** wasn't implemented at all originally — added
-  via `resolveCgiScript()`.
-- **An O(n²) blowup in `try_parse_request()`**, found via the official
-  tester's own 20-concurrent-100MB-CGI-POST stress case (a CPU core
-  pegged for 9+ minutes with zero progress): the chunked decoder re-scanned
-  and re-copied the whole body-so-far on every partial read, and — even
-  after fixing that — the header/body separator was still being
-  re-derived via a full string search on every call too. Fixed by making
-  both resumable/cached instead of redone from scratch (`chunked_scan_pos`,
-  `body_start`).
-- **`cgi_tester`'s non-standard `PATH_INFO` expectation** and **CGI
-  dispatch requiring the target file to exist** (it shouldn't, for an
-  interpreter like `cgi_tester` that never touches the filesystem) — both
-  found by running the official tester and reverse-engineering its exact
-  checks, both fixed in `CgiHandler.cpp`/`RequestHandler.cpp`.
-- **Missing per-location `client_max_body_size`** — the config format only
-  ever supported a server-wide limit, but the official tester's
-  `/post_body` route needs its own tighter one. Added as a `Location`-level
-  override.
-
 ---
 
-## Part 4 — Where things stand
+# Appendix D — Where things stand
 
 - Code lives on the `kai` branch of `github.com/Kai-Doh/Webserv`, merged
   into `main`; `william` holds the Core Server side.
 - `main` is a working, integrated `webserv` binary: `srcs/main.cpp` →
-  `Server::run()` → this module, CGI pipes included — not two halves
-  sitting side by side.
+  `Server::run()` → this module, CGI pipes included.
 - Every non-trivial function across this module has a `@brief`/`@param`/
-  `@return` doc-comment.
-- Outstanding: nothing blocking on this module's side. Ongoing
-  maintenance (new config directives, additional CGI env vars, etc.)
-  would extend `srcs/config/Config.cpp` and `srcs/cgi/CgiHandler.cpp`
-  respectively.
+  `@return` doc-comment in the source itself — this document explains the
+  *why*; the source comments pin down the exact *what*.
+- Outstanding: nothing blocking. Virtual hosting (routing by `Host:`
+  header to different `server{}` blocks sharing one port) is explicitly
+  optional per the subject and isn't implemented; everything the subject
+  actually requires is.
