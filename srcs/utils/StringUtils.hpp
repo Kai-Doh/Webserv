@@ -18,6 +18,6 @@ long toLong(const std::string& s, bool& ok);
 std::string urlDecode(const std::string& s);
 std::string headerKeyToEnv(const std::string& key);
 
-}  // namespace su
+}
 
 #endif

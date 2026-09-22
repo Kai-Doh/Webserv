@@ -100,13 +100,13 @@ bool resolveCgiScript(const Location& loc, const std::string& rel, std::string& 
         std::string candidate = joinPath(loc.root, builtRel);
         struct stat st;
         if (stat(candidate.c_str(), &st) != 0)
-            continue;  // no such entry yet at this depth: keep walking
+            continue;
         if (!S_ISREG(st.st_mode))
-            continue;  // a directory component: the script must be further down
+            continue;
         std::map<std::string, std::string>::const_iterator it =
             loc.cgi_extensions.find(extensionOf(candidate));
         if (it == loc.cgi_extensions.end())
-            return false;  // a regular file, but not a CGI script: no valid boundary here
+            return false;
         scriptFsPath = candidate;
         interpreter = it->second;
         std::string remaining;
@@ -173,7 +173,7 @@ void serveAutoindex(Connection& conn, const std::string& fsDir, const std::strin
     request_handler::writeResponse(conn, 200, "text/html", body);
 }
 
-}  // namespace
+}
 
 namespace request_handler {
 
@@ -203,11 +203,6 @@ void writeResponse(Connection& conn, int code, const std::string& contentType,
     out << extraHeaders;
     out << "\r\n";
     conn.write_buffer = out.str();
-    // RFC 7231 4.3.2: a response to HEAD must never carry a body, whatever
-    // the status code -- Content-Length still reports what GET would have
-    // sent. Sending the body anyway desyncs any client that (correctly)
-    // treats the connection as idle right after the headers, corrupting
-    // every request pipelined after it on the same keep-alive connection.
     if (conn.method != "HEAD")
         conn.write_buffer += body;
     conn.bytes_written = 0;
@@ -235,7 +230,7 @@ void writeErrorResponse(Connection& conn, int code) {
     writeResponse(conn, code, "text/html", http_status::defaultErrorBody(code));
 }
 
-}  // namespace request_handler
+}
 
 /**
  * @brief Routes a fully-parsed request and writes a response into conn.
@@ -294,10 +289,6 @@ void handle_request(Connection& conn) {
         return;
     }
 
-    // conn.path can be shorter than loc->path here: matchLocation() lets a
-    // "/directory/"-style location match the slash-less "/directory" too
-    // (so the redirect-to-trailing-slash logic below can fire instead of a
-    // spurious 404), and in that case there is no remainder to strip.
     std::string rel = (conn.path.size() >= loc->path.size())
                            ? conn.path.substr(loc->path.size())
                            : "";
@@ -347,20 +338,11 @@ void handle_request(Connection& conn) {
         std::map<std::string, std::string>::const_iterator directIt =
             loc->cgi_extensions.find(extensionOf(fsPath));
         if (directIt != loc->cgi_extensions.end()) {
-            // fsPath's own extension is CGI-mapped even though nothing
-            // exists there -- dispatch anyway rather than 404ing. Matches
-            // both a front-controller-style interpreter (common in real
-            // deployments) and the official cgi_tester binary, which
-            // never touches the filesystem and answers for any
-            // .bla-suffixed path regardless of whether it exists.
             cgiScriptFsPath = fsPath;
             cgiInterpreter = directIt->second;
             isCgi = true;
             cgiTargetMustExist = false;
         } else {
-            // The full path isn't a file, but a shorter prefix of it might
-            // be a CGI script with PATH_INFO trailing it (RFC 3875) -- e.g.
-            // /cgi-bin/script.py/extra/thing.
             isCgi = resolveCgiScript(*loc, rel, cgiScriptFsPath, cgiPathInfo, cgiInterpreter);
         }
     }
@@ -378,21 +360,12 @@ void handle_request(Connection& conn) {
 
     if (conn.method == "POST") {
         if (!loc->upload_enabled) {
-            // A location can allow POST without configuring upload_store --
-            // it's just not meant to persist anything (e.g. accepting a
-            // body without storing it). Acknowledge rather than reject:
-            // methodAllowed() above is what actually gates whether POST is
-            // permitted here at all.
             conn.status_code = 200;
             request_handler::writeResponse(conn, 200, "text/plain", "OK\n");
             return;
         }
         std::string filename = basenameOf(rel);
         if (filename.empty()) {
-            // conn.fd alone is unique among connections open right now;
-            // std::time(0) makes it unique across restarts too. getpid()
-            // would do the same job but isn't on the subject's p.6
-            // authorized-function list.
             std::ostringstream gen;
             gen << "upload_" << static_cast<long>(std::time(0)) << "_" << conn.fd;
             filename = gen.str();
@@ -412,8 +385,6 @@ void handle_request(Connection& conn) {
         return;
     }
 
-    // Only GET remains: every other method was already turned away above
-    // by loc->methodAllowed() unless explicitly handled (DELETE, POST).
     if (!exists) {
         request_handler::writeErrorResponse(conn, 404);
         return;
@@ -421,12 +392,6 @@ void handle_request(Connection& conn) {
 
     if (S_ISDIR(st.st_mode)) {
         if (conn.path.empty() || conn.path[conn.path.size() - 1] != '/') {
-            // Standard practice (nginx/Apache): a directory request without
-            // a trailing slash redirects to the slash-terminated form,
-            // rather than silently serving it -- relative links in the
-            // served page (autoindex entries, an index.html's own assets)
-            // are resolved against the URL path, so serving content at a
-            // slash-less path would break them.
             std::string target = conn.path + "/";
             if (!conn.query_string.empty())
                 target += "?" + conn.query_string;
@@ -447,8 +412,6 @@ void handle_request(Connection& conn) {
             serveAutoindex(conn, fsPath, conn.path);
             return;
         }
-        // 404, not 403: from the client's perspective there's simply no
-        // resource at this URL.
         request_handler::writeErrorResponse(conn, 404);
         return;
     }

@@ -1,10 +1,3 @@
-// Entry point: loads the config, then hands the whole run to the Core
-// Server's single-poll() event loop (core/Server.hpp) until SIGINT/SIGTERM.
-// This replaces harness_main.cpp, the throwaway stand-in used while the
-// HTTP+CGI half was developed against a real Core Server that didn't exist
-// yet -- Server now drives try_parse_request()/handle_request() the same
-// way, plus the CGI pipe integration that was missing from it
-// (see core/ServerCgi.cpp).
 #include "core/Server.hpp"
 #include "config/Config.hpp"
 
@@ -22,9 +15,6 @@
  *         setup, or a malformed config).
  */
 int main(int argc, char** argv) {
-    // Subject p.8: "a configuration file, provided as an argument on the
-    // command line, or available in a default path" -- so a missing
-    // argument falls back to DEFAULT_CONFIG_PATH instead of a hard error.
     if (argc > 2) {
         std::fprintf(stderr, "usage: %s [config file]\n", argv[0]);
         return 1;

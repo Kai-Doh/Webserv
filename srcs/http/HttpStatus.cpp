@@ -65,4 +65,4 @@ std::string mimeType(const std::string& path) {
     return "application/octet-stream";
 }
 
-}  // namespace http_status
+}

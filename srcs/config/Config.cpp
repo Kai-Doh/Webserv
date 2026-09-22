@@ -29,16 +29,8 @@ const Location* ServerConfig::matchLocation(const std::string& reqPath) const {
         if (reqPath == p) {
             matches = true;
         } else if (p.size() > 1 && p[p.size() - 1] == '/' && reqPath == p.substr(0, p.size() - 1)) {
-            // A location declared with a trailing slash ("/directory/")
-            // must still match the request path without it ("/directory"),
-            // so handle_request() can see it resolves to a directory and
-            // issue the standard slash-redirect instead of 404ing via the
-            // catch-all "/" location.
             matches = true;
         } else if (su::startsWith(reqPath, p)) {
-            // Prefix match must land on a path boundary: "/kapouet" matches
-            // "/kapouet/x" but not "/kapouetXYZ". A location path of "/" is
-            // the universal catch-all.
             if (p == "/" || (p.size() > 0 && p[p.size() - 1] == '/'))
                 matches = true;
             else if (reqPath.size() > p.size() && reqPath[p.size()] == '/')
@@ -106,7 +98,6 @@ std::vector<std::string> tokenize(const std::string& text) {
  * @param loc Filled in with whatever directives were found.
  */
 void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc) {
-    // tok[i] is the location path, tok[i+1] must be "{"
     loc.path = tok[i++];
     if (i >= tok.size() || tok[i] != "{")
         throw std::runtime_error("expected '{' after location " + loc.path);
@@ -158,7 +149,7 @@ void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc
     }
     if (i >= tok.size())
         throw std::runtime_error("unterminated location block for " + loc.path);
-    ++i;  // consume "}"
+    ++i;
 }
 
 /**
@@ -169,7 +160,6 @@ void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc
  * @param srv Filled in with whatever directives/locations were found.
  */
 void parseServer(const std::vector<std::string>& tok, size_t& i, ServerConfig& srv) {
-    // tok[i] is "{"
     ++i;
     while (i < tok.size() && tok[i] != "}") {
         const std::string& directive = tok[i++];
@@ -212,10 +202,10 @@ void parseServer(const std::vector<std::string>& tok, size_t& i, ServerConfig& s
     }
     if (i >= tok.size())
         throw std::runtime_error("unterminated server block");
-    ++i;  // consume "}"
+    ++i;
 }
 
-}  // namespace
+}
 
 /**
  * @brief Loads and parses a webserv config file.

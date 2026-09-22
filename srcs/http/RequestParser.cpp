@@ -9,27 +9,22 @@ namespace {
 const size_t MAX_HEADER_SECTION = 8192;
 const size_t MAX_URI_LENGTH = 8000;
 
-}  // namespace
+}
 
 namespace request_parser {
 
 bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bool& malformed) {
     malformed = false;
     const std::string& data = conn.read_buffer;
-    // Resume exactly where the last call left off -- everything before
-    // this point is already a confirmed, complete chunk whose payload is
-    // already sitting in conn.body. See the field's comment in
-    // connection.hpp for why re-scanning from bodyStart every call (the
-    // previous implementation) is a correctness-preserving but O(n^2) trap.
     size_t pos = bodyStart + conn.chunked_scan_pos;
 
     while (true) {
         size_t lineEnd = data.find("\r\n", pos);
         if (lineEnd == std::string::npos)
-            return false;  // need more data to even read the size line
+            return false;
 
         std::string sizeLine = data.substr(pos, lineEnd - pos);
-        size_t semi = sizeLine.find(';');  // drop chunk-extensions, we don't use them
+        size_t semi = sizeLine.find(';');
         if (semi != std::string::npos)
             sizeLine = sizeLine.substr(0, semi);
         sizeLine = su::trim(sizeLine);
@@ -48,13 +43,11 @@ bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bo
         size_t chunkDataStart = lineEnd + 2;
 
         if (chunkSize == 0) {
-            // Trailer section: zero or more "Name: value\r\n" lines,
-            // terminated by a lone blank "\r\n".
             size_t p = chunkDataStart;
             while (true) {
                 size_t nl = data.find("\r\n", p);
                 if (nl == std::string::npos)
-                    return false;  // wait for the rest of the trailer
+                    return false;
                 if (nl == p) {
                     p = nl + 2;
                     break;
@@ -66,18 +59,18 @@ bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bo
         }
 
         if (data.size() < chunkDataStart + chunkSize + 2)
-            return false;  // wait for the rest of this chunk
+            return false;
         if (data.compare(chunkDataStart + chunkSize, 2, "\r\n") != 0) {
             malformed = true;
             return false;
         }
         conn.body.append(data, chunkDataStart, chunkSize);
         pos = chunkDataStart + chunkSize + 2;
-        conn.chunked_scan_pos = pos - bodyStart;  // commit: this chunk is done, never redo it
+        conn.chunked_scan_pos = pos - bodyStart;
     }
 }
 
-}  // namespace request_parser
+}
 
 namespace {
 
@@ -90,7 +83,7 @@ namespace {
  */
 bool findHeaderEnd(const std::string& buf, size_t& headerEnd, size_t& sepLen) {
     size_t crlf = buf.find("\r\n\r\n");
-    size_t lf = buf.find("\n\n");  // telnet-friendly fallback
+    size_t lf = buf.find("\n\n");
     if (crlf != std::string::npos && (lf == std::string::npos || crlf <= lf)) {
         headerEnd = crlf;
         sepLen = 4;
@@ -145,7 +138,7 @@ void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn)
         conn.read_buffer.erase(0, consumedBytes);
 }
 
-}  // namespace
+}
 
 /**
  * @brief Tries to parse one full HTTP request out of conn.read_buffer.
@@ -172,28 +165,12 @@ bool try_parse_request(Connection& conn) {
                 failParse(conn, 431, buf.size(), true);
                 return true;
             }
-            return false;  // headers not fully arrived yet
+            return false;
         }
-        // The check above only catches an incomplete, still-growing header
-        // section. An oversized header section that completes in a single
-        // read() (the common case for anything short of a slow-loris-style
-        // drip feed) would otherwise sail straight past it, since
-        // findHeaderEnd() already succeeded above -- so the limit must be
-        // enforced again here, now that the header section's true length is
-        // known.
-        //
-        // The request line's own length is checked first, and separately
-        // from the overall section: an oversized URI necessarily also blows
-        // past MAX_HEADER_SECTION (a 9000-byte target alone already exceeds
-        // it), so checking section size first would always report 431 and
-        // make 414 unreachable. Checking the request line specifically
-        // first lets an overlong URI report 414, while a short URI with
-        // merely bloated headers still correctly falls through to 431
-        // below.
         size_t firstLineEnd = buf.find('\n', 0);
         if (firstLineEnd == std::string::npos || firstLineEnd > headerEnd)
             firstLineEnd = headerEnd;
-        if (firstLineEnd > MAX_URI_LENGTH + 32) {  // slack for "METHOD "+" HTTP/x.y"+CR
+        if (firstLineEnd > MAX_URI_LENGTH + 32) {
             failParse(conn, 414, headerEnd + sepLen, true);
             return true;
         }
@@ -211,7 +188,6 @@ bool try_parse_request(Connection& conn) {
             return true;
         }
 
-        // --- Request line ---
         std::string requestLine = su::trim(lines[0]);
         std::vector<std::string> parts = su::split(requestLine, ' ');
         if (parts.size() != 3) {
@@ -247,7 +223,6 @@ bool try_parse_request(Connection& conn) {
             queryString = target.substr(qpos + 1);
         }
 
-        // --- Headers ---
         std::map<std::string, std::string> headers;
         for (size_t i = 1; i < lines.size(); ++i) {
             std::string line = su::trim(lines[i]);
@@ -263,7 +238,7 @@ bool try_parse_request(Connection& conn) {
             std::map<std::string, std::string>::iterator existing = headers.find(key);
             if (existing != headers.end()) {
                 if (key == "content-length" && existing->second != value) {
-                    failParse(conn, 400, bodyStart, true);  // conflicting lengths: possible smuggling
+                    failParse(conn, 400, bodyStart, true);
                     return true;
                 }
                 existing->second = value;
@@ -287,10 +262,6 @@ bool try_parse_request(Connection& conn) {
                 keepAlive = true;
         }
 
-        // Commit and stop redoing this work: every later call for this same
-        // request (there can be thousands while a large body streams in)
-        // takes the `if (!conn.headers_ready)` branch above and skips
-        // straight past it, reading these back out of conn instead.
         conn.method = method;
         conn.path = collapseSlashes(su::urlDecode(rawPath));
         conn.query_string = queryString;
@@ -306,10 +277,6 @@ bool try_parse_request(Connection& conn) {
     size_t maxBody = conn.server_conf ? conn.server_conf->client_max_body_size
                                        : static_cast<size_t>(-1);
     if (conn.server_conf) {
-        // Matched early (handle_request() does its own, identical match
-        // later) purely to see whether this route overrides the body-size
-        // limit -- a location can be given a tighter one than its server
-        // to deliberately exercise 413 on a specific route.
         const Location* earlyLoc = conn.server_conf->matchLocation(conn.path);
         if (earlyLoc && earlyLoc->client_max_body_size != Location::NO_BODY_SIZE_OVERRIDE)
             maxBody = earlyLoc->client_max_body_size;
@@ -322,10 +289,6 @@ bool try_parse_request(Connection& conn) {
     std::string body;
 
     if (chunked) {
-        // Bail out before decoding a runaway chunked body into memory:
-        // decoded size is always <= encoded size, so once the still-encoded
-        // bytes we already hold blow past the limit (plus generous slack
-        // for chunk-framing overhead) there is no need to keep buffering.
         if (maxBody <= static_cast<size_t>(-1) - 65536 && buf.size() - bodyStart > maxBody + 65536) {
             failParse(conn, 413, buf.size(), true);
             return true;
@@ -339,19 +302,13 @@ bool try_parse_request(Connection& conn) {
                 conn.chunked_scan_pos = 0;
                 return true;
             }
-            // Still incomplete: conn.body/conn.chunked_scan_pos already
-            // reflect every chunk confirmed so far (see decodeChunked's
-            // comment), so the *next* call resumes there instead of
-            // re-scanning from bodyStart -- checked here too, not just at
-            // the end, so a runaway body is rejected as soon as it crosses
-            // the limit rather than only once fully terminated.
             if (conn.body.size() > maxBody) {
                 failParse(conn, 413, buf.size(), true);
                 conn.body.clear();
                 conn.chunked_scan_pos = 0;
                 return true;
             }
-            return false;  // wait for the rest of the chunked body
+            return false;
         }
         if (conn.body.size() > maxBody) {
             failParse(conn, 413, bodyStart + totalConsumed, true);
@@ -360,7 +317,7 @@ bool try_parse_request(Connection& conn) {
             return true;
         }
         body = conn.body;
-        conn.chunked_scan_pos = 0;  // ready for the next request on this connection
+        conn.chunked_scan_pos = 0;
         buf.erase(0, bodyStart + totalConsumed);
     } else {
         std::map<std::string, std::string>::const_iterator clHeader = conn.headers.find("content-length");
@@ -377,20 +334,16 @@ bool try_parse_request(Connection& conn) {
                 return true;
             }
             if (buf.size() < bodyStart + contentLength)
-                return false;  // wait for the rest of the body
+                return false;
             body = buf.substr(bodyStart, contentLength);
             buf.erase(0, bodyStart + contentLength);
         } else {
-            // No Transfer-Encoding and no Content-Length: RFC 7230
-            // 3.3.3 case 6 defines the body length as zero, for any
-            // method including POST -- this is not an error (curl -X
-            // POST with no -d, and nginx, both treat it this way).
             buf.erase(0, bodyStart);
         }
     }
 
     conn.body = body;
     conn.status_code = 0;
-    conn.headers_ready = false;  // done with this request; next call starts fresh
+    conn.headers_ready = false;
     return true;
 }

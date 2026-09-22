@@ -56,19 +56,10 @@ std::string parentPath() {
  * @return "KEY=value" strings ready for execve()'s envp.
  */
 std::vector<std::string> buildEnv(const Connection& conn, const std::string& scriptPath) {
-    // SCRIPT_NAME is conn.path with the trailing PATH_INFO (if any) removed
-    // -- the two always concatenate back to the request path by construction
-    // (see resolveCgiScript() in RequestHandler.cpp).
     std::string scriptName = conn.path;
     if (!conn.cgi_path_info.empty() && conn.cgi_path_info.size() <= scriptName.size())
         scriptName.erase(scriptName.size() - conn.cgi_path_info.size());
 
-    // The official 42 cgi_tester binary (subject-provided) checks PATH_INFO
-    // against the *full* request path when the script itself is the exact
-    // request target, not empty as RFC 3875 would have it. Only fall back
-    // to that when there's genuinely no RFC-3875 extra-path component, so
-    // a real PATH_INFO-walking request (e.g. /cgi-bin/script.py/extra/thing)
-    // still gets the standards-correct trailing segment.
     std::string pathInfoEnv = conn.cgi_path_info.empty() ? conn.path : conn.cgi_path_info;
 
     std::vector<std::string> env;
@@ -135,7 +126,7 @@ void finishFromCgiOutput(Connection& conn, const std::string& raw) {
     std::string head;
     std::string body;
     if (sep == std::string::npos) {
-        body = raw;  // no blank-line separator: treat it all as body
+        body = raw;
     } else {
         head = raw.substr(0, sep);
         body = raw.substr(sep + sepLen);
@@ -176,7 +167,7 @@ void finishFromCgiOutput(Connection& conn, const std::string& raw) {
     request_handler::writeResponse(conn, statusCode, contentType, body, extraHeaders);
 }
 
-}  // namespace
+}
 
 namespace cgi_handler {
 
@@ -201,8 +192,8 @@ bool start(Connection& conn, const std::string& scriptPath, const std::string& i
            const Location& loc) {
     (void)loc;
 
-    int inPipe[2];   // parent writes conn.body -> child stdin
-    int outPipe[2];  // child stdout -> parent reads
+    int inPipe[2];
+    int outPipe[2];
     if (pipe(inPipe) != 0) {
         request_handler::writeErrorResponse(conn, 500);
         return false;
@@ -230,7 +221,6 @@ bool start(Connection& conn, const std::string& scriptPath, const std::string& i
     }
 
     if (pid == 0) {
-        // --- child ---
         dup2(inPipe[0], STDIN_FILENO);
         dup2(outPipe[1], STDOUT_FILENO);
         close(inPipe[0]);
@@ -251,11 +241,9 @@ bool start(Connection& conn, const std::string& scriptPath, const std::string& i
         envp.push_back(0);
 
         execve(interpreter.c_str(), &argv[0], &envp[0]);
-        _exit(127);  // execve failed
+        _exit(127);
     }
 
-    // --- parent: nothing here blocks or polls on its own; the Core
-    // Server drives these two fds through the shared poll() from here on ---
     close(inPipe[0]);
     close(outPipe[1]);
     fcntl(inPipe[1], F_SETFL, O_NONBLOCK);
@@ -288,13 +276,6 @@ bool start(Connection& conn, const std::string& scriptPath, const std::string& i
 void onStdinWritable(Connection& conn) {
     if (conn.cgi_stdin_fd == -1)
         return;
-    // NOTE: deliberately never close(conn.cgi_stdin_fd) here -- only mark
-    // it -1. Closing it immediately would free the fd number for reuse by
-    // a later accept()/pipe() call within the *same* poll() iteration,
-    // while the Core Server's poll_fds bookkeeping for this fd is still
-    // deferred to that iteration's single end-of-pass cleanup; it closes
-    // the fd exactly once there, after seeing cgi_stdin_fd become -1 (see
-    // the caller in srcs/core/ServerCgi.cpp).
     size_t remaining = conn.body.size() - conn.cgi_in_offset;
     ssize_t n = write(conn.cgi_stdin_fd, conn.body.data() + conn.cgi_in_offset, remaining);
     if (n > 0) {
@@ -302,8 +283,6 @@ void onStdinWritable(Connection& conn) {
         if (conn.cgi_in_offset == conn.body.size())
             conn.cgi_stdin_fd = -1;
     } else {
-        // Broken pipe or a spurious zero-length write: stop feeding the
-        // CGI, but keep reading whatever output it still produces.
         conn.cgi_stdin_fd = -1;
     }
 }
@@ -317,7 +296,6 @@ void onStdinWritable(Connection& conn) {
 void onStdoutReadable(Connection& conn) {
     if (conn.cgi_stdout_fd == -1)
         return;
-    // Same reasoning as onStdinWritable(): never close() here, only mark.
     char buf[4096];
     ssize_t n = read(conn.cgi_stdout_fd, buf, sizeof(buf));
     if (n > 0)
@@ -348,9 +326,6 @@ bool isDone(const Connection& conn) {
 bool finish(Connection& conn, pid_t& pendingPid) {
     pendingPid = 0;
     if (conn.cgi_pid == -1) {
-        // Already handled (e.g. by a forced close this same iteration):
-        // never call waitpid(-1, ...) -- "reap any child" -- that would
-        // risk stealing an unrelated CGI's exit status.
         finishFromCgiOutput(conn, conn.cgi_out);
         conn.state = WRITING_RESPONSE;
         return true;
@@ -358,10 +333,10 @@ bool finish(Connection& conn, pid_t& pendingPid) {
     int status = 0;
     pid_t reaped = waitpid(conn.cgi_pid, &status, WNOHANG);
     if (reaped != conn.cgi_pid)
-        return false;  // pipes closed but not reapable yet: caller retries later
+        return false;
 
     bool execFailed = WIFEXITED(status) && WEXITSTATUS(status) == 127;
-    bool crashed = WIFSIGNALED(status);  // e.g. a script that segfaults
+    bool crashed = WIFSIGNALED(status);
     conn.cgi_pid = -1;
 
     if ((execFailed || crashed) && conn.cgi_out.empty())
@@ -380,14 +355,7 @@ bool finish(Connection& conn, pid_t& pendingPid) {
  * @return A pid still needing reapIfExited(), or 0 if already reaped.
  */
 pid_t abortTimeout(Connection& conn) {
-    // Same "never close() here" reasoning as onStdinWritable()/
-    // onStdoutReadable() above -- the caller (srcs/core/ServerCgi.cpp)
-    // captures conn.cgi_stdin_fd/cgi_stdout_fd *before* calling this and
-    // defers their actual close() to its own bookkeeping.
     if (conn.cgi_pid == -1) {
-        // Never reachable via the guarded call site today, but kill(-1,
-        // SIGKILL) -- "signal every process this user can reach" -- is
-        // catastrophic enough that this stays defended on its own too.
         conn.cgi_stdin_fd = -1;
         conn.cgi_stdout_fd = -1;
         request_handler::writeErrorResponse(conn, 504);
@@ -413,4 +381,4 @@ bool reapIfExited(pid_t pid) {
     return waitpid(pid, &status, WNOHANG) == pid;
 }
 
-}  // namespace cgi_handler
+}

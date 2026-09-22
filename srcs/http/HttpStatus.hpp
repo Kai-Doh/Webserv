@@ -9,6 +9,6 @@ std::string reasonPhrase(int code);
 std::string defaultErrorBody(int code);
 std::string mimeType(const std::string& path);
 
-}  // namespace http_status
+}
 
 #endif

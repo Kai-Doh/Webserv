@@ -1,10 +1,6 @@
 #ifndef REQUEST_PARSER_HPP
 #define REQUEST_PARSER_HPP
 
-// try_parse_request(Connection&) itself is declared in connection.hpp
-// (it's part of the shared contract). This header only exposes a couple
-// of pieces that RequestHandler / tests find convenient to reuse.
-
 #include <cstddef>
 
 struct Connection;
@@ -32,6 +28,6 @@ namespace request_parser {
  */
 bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bool& malformed);
 
-}  // namespace request_parser
+}
 
 #endif

@@ -6,32 +6,18 @@
 #include <map>
 #include <cstddef>
 
-// Minimal, nginx-inspired configuration model.
-//
-// NOTE ON SCOPE: parsing the configuration file is officially the Core
-// Server teammate's responsibility (see guide_jour1_HTTP_CGI.md, part 5,
-// "Parser le fichier de configuration"). This parser exists only so the
-// HTTP + CGI code (RequestHandler, CgiHandler) has something real to route
-// against while being developed and tested in isolation. The *shape* of
-// ServerConfig/Location below is the actual contract handle_request()
-// relies on -- keep it, even if the parsing implementation itself gets
-// replaced later.
-
 struct Location {
-    std::string path;                          // e.g. "/kapouet"
-    std::string root;                           // filesystem root, e.g. "www"
-    std::vector<std::string> methods;            // allowed methods, e.g. GET/POST/DELETE
+    std::string path;
+    std::string root;
+    std::vector<std::string> methods;
     bool autoindex;
-    std::string index;                           // default file served for a directory
-    std::string redirect_target;                 // if non-empty: always redirect here
+    std::string index;
+    std::string redirect_target;
     int redirect_code;
     bool upload_enabled;
-    std::string upload_store;                    // where uploaded files are written
-    std::map<std::string, std::string> cgi_extensions;  // ".py" -> "/usr/bin/python3"
+    std::string upload_store;
+    std::map<std::string, std::string> cgi_extensions;
 
-    // Per-location override of the server's client_max_body_size, e.g. a
-    // route deliberately given a small limit to exercise 413. Sentinel
-    // value below means "not set here -- use the server's".
     size_t client_max_body_size;
     static const size_t NO_BODY_SIZE_OVERRIDE = static_cast<size_t>(-1);
 
@@ -47,19 +33,16 @@ struct ServerConfig {
     int port;
     std::string server_name;
     size_t client_max_body_size;
-    std::map<int, std::string> error_pages;       // status -> path to custom body
+    std::map<int, std::string> error_pages;
     std::vector<Location> locations;
 
     ServerConfig() : port(8080), client_max_body_size(1 * 1024 * 1024) {}
 
-    // Longest-prefix match, nginx style. Returns 0 if nothing matches.
     const Location* matchLocation(const std::string& reqPath) const;
 };
 
 class Config {
 public:
-    // Throws std::runtime_error with a human-readable message on any
-    // malformed input -- a config file must never crash the server.
     static std::vector<ServerConfig> load(const std::string& path);
 };
 
