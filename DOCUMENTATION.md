@@ -176,6 +176,22 @@ GET /index.html HTTP/1.1
 method  target    version
 ```
 
+```cpp
+std::string requestLine = su::trim(lines[0]);
+std::vector<std::string> parts = su::split(requestLine, ' ');
+if (parts.size() != 3) {
+    failParse(conn, 400, bodyStart, true);
+    return true;
+}
+std::string method = parts[0];
+std::string target = parts[1];
+std::string version = parts[2];
+```
+
+`su::split(requestLine, ' ')` on anything that isn't *exactly* three
+space-separated pieces gives a vector whose size isn't 3 — that one check
+covers "too few pieces," "too many pieces," and "empty line" all at once.
+
 - **Not exactly three pieces** (extra spaces, missing pieces) → `400 Bad
   Request`. A request line is a fixed, rigid format; there's no reasonable
   way to guess what was meant if it doesn't match.
@@ -197,7 +213,36 @@ is too large" check, not after — otherwise an absurdly long URL would
 always trip the generic 8192-byte cap first and you'd never actually see a
 414, only ever 431. Order of checks matters here, and it's a good example
 of a bug that's invisible until you specifically go looking for it (which
-is exactly how it *was* found, later — see Chapter 10).
+is exactly how it *was* found, later — see Appendix B).
+
+**One more check on the target, easy to miss but important: no raw NUL
+bytes allowed, once decoded.** The target is percent-decoded (`%2E` →
+`.`, `%2F` → `/`, and so on — the same decoding a browser does before
+submitting a form) into what becomes `conn.path`, and the decoded result
+is checked for a literal `\0` byte before it's trusted for anything:
+
+```cpp
+std::string decodedPath = collapseSlashes(su::urlDecode(rawPath));
+if (decodedPath.find('\0') != std::string::npos) {
+    failParse(conn, 400, bodyStart, true);
+    return true;
+}
+```
+
+**Why this matters, concretely:** every filesystem call downstream
+(`stat()`, `std::ifstream`, ...) takes a plain C string, which ends at the
+*first* `\0` it finds — but a C++ `std::string` doesn't; it just carries
+that byte along as ordinary data. Without this check, a request for
+`/cgi-bin/script.py%00.txt` would decode to a `std::string` containing
+`script.py`, a NUL byte, then `.txt`. The code that decides "is this a CGI
+script?" (Chapter 3) looks at the *whole* string and sees the extension
+`.txt` — not a configured CGI extension, so: not CGI. The filesystem call
+that actually opens the file, right after, only sees up to the NUL and
+opens the real `script.py`. Put those two together and the script's raw
+*source code* gets served back as plain text instead of being executed —
+a real, well-known vulnerability class (the same NUL-byte trick that hit
+early PHP installations). Rejecting the NUL outright, before either check
+gets a chance to disagree with the other, closes it for good.
 
 ## 2.3 — Headers: turning lines into a lookup table
 
@@ -236,6 +281,39 @@ A line with no colon at all isn't a header — it's garbage — so that's a
   because a single server can host multiple different sites — `Host` is
   how the request says *which one it means*. A 1.1 request without it is
   simply malformed by the spec, not a matter of leniency.
+
+Two more hardening checks live right here too, both added after running an
+independent third-party HTTP conformance test suite against the server and
+seeing exactly what it could get away with:
+
+- **More than 100 header lines → `431`.** The byte cap from §2.1 stops a
+  client from sending one giant header section, but says nothing about
+  sending *thousands of tiny ones* instead — so there's a separate count
+  check, right alongside the byte-size one:
+  ```cpp
+  if (lines.size() > MAX_HEADER_COUNT + 1) {
+      failParse(conn, 431, bodyStart, true);
+      return true;
+  }
+  ```
+- **`Content-Length` *and* `Transfer-Encoding: chunked`, both present on
+  the same request → `400`, unconditionally**, instead of picking one of
+  the two and ignoring the other:
+  ```cpp
+  if (chunkedTE && headers.find("content-length") != headers.end()) {
+      // RFC 7230 3.3.3: a message with both headers is a smuggling
+      // risk and must be rejected outright, not resolved by picking
+      // one of the two framings.
+      failParse(conn, 400, bodyStart, true);
+      return true;
+  }
+  ```
+  This is the other half of the request-smuggling defense described above
+  for a *repeated* `Content-Length` — here it's two *different* framing
+  mechanisms disagreeing about where the body ends, which is exactly the
+  ambiguity a smuggled request hides inside. The fix follows the same
+  principle both times: when two trusted signals disagree, don't guess
+  which one to believe — refuse the request outright.
 
 ## 2.4 — Caching what we've learned: `headers_ready`
 
@@ -326,7 +404,14 @@ Every single rejection path above — bad request line, bad version, huge
 header, huge body, whatever — funnels through one function:
 
 ```cpp
-void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn);
+void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn) {
+    conn.status_code = code;
+    conn.keep_alive = !closeConn;
+    if (consumedBytes >= conn.read_buffer.size())
+        conn.read_buffer.clear();
+    else
+        conn.read_buffer.erase(0, consumedBytes);
+}
 ```
 
 It sets `conn.status_code`, trims the bad bytes out of the buffer, and
@@ -455,6 +540,42 @@ location's allowed set, gets the more specific `405`, along with an
 `Allow:` header listing what actually *is* permitted — which is itself a
 spec requirement (RFC 7231 §6.5.5), not just a nicety.
 
+```cpp
+bool isKnownMethod(const std::string& method) {
+    return method == "GET" || method == "POST" || method == "DELETE" ||
+           method == "HEAD" || method == "PUT" || method == "OPTIONS" ||
+           method == "PATCH";
+}
+```
+
+and the actual branch in `handle_request()` that uses it:
+
+```cpp
+if (!loc->methodAllowed(conn.method)) {
+    if (!isKnownMethod(conn.method)) {
+        conn.status_code = 501;
+        request_handler::writeErrorResponse(conn, 501, loc);
+        return;
+    }
+    std::string allow;
+    for (size_t i = 0; i < loc->methods.size(); ++i) {
+        allow += loc->methods[i];
+        if (i + 1 < loc->methods.size())
+            allow += ", ";
+    }
+    conn.status_code = 405;
+    request_handler::writeResponse(conn, 405, "text/html", http_status::defaultErrorBody(405),
+                                    "Allow: " + allow + "\r\n");
+    return;
+}
+```
+
+Notice the order: `isKnownMethod()` is only even consulted *after*
+`loc->methodAllowed()` already said no. A method the location genuinely
+does allow never has to prove it's "known" first — the whitelist exists
+purely to pick the right rejection code, not to gate anything on the
+success path.
+
 ---
 
 # Chapter 4 — Serving static files, directories, uploads, and deletes
@@ -472,6 +593,30 @@ supported) → `403`; `std::remove()` fails for some other reason
 response for "the thing you asked me to do is done, and there's nothing
 useful to send back."
 
+```cpp
+if (conn.method == "DELETE") {
+    if (!exists) {
+        request_handler::writeErrorResponse(conn, 404, loc);
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        request_handler::writeErrorResponse(conn, 403, loc);
+        return;
+    }
+    if (std::remove(fsPath.c_str()) != 0) {
+        request_handler::writeErrorResponse(conn, 403, loc);
+        return;
+    }
+    conn.status_code = 204;
+    request_handler::writeResponse(conn, 204, "", "");
+    return;
+}
+```
+
+Every branch here `return`s immediately — there's no fall-through, so
+there's never a chance of accidentally reaching the `GET`-handling code
+below with a `DELETE` still in flight.
+
 ## 4.2 — `POST` (uploads)
 
 If the matched location has no `upload_store` configured, the server
@@ -486,6 +631,24 @@ answers **`201 Created`** with a `Location:` header pointing at the new
 resource — the standard way to tell a client "here's where what you just
 sent now lives."
 
+```cpp
+std::string filename = basenameOf(rel);
+if (filename.empty()) {
+    std::ostringstream gen;
+    gen << "upload_" << static_cast<long>(std::time(0)) << "_" << conn.fd;
+    filename = gen.str();
+}
+std::string dest = joinPath(loc->upload_store, filename);
+std::ofstream out(dest.c_str(), std::ios::binary | std::ios::trunc);
+```
+
+`basenameOf(rel)` is "everything after the last `/`" — so `POST
+/upload/photo.jpg` names the file `photo.jpg`, while a bare `POST /upload/`
+(nothing after the trailing slash) falls into the `filename.empty()`
+branch and gets a generated name instead, combining the current time with
+`conn.fd` so two uploads landing in the same second on different
+connections still can't collide.
+
 ## 4.3 — `GET` (and the fall-through case for everything else)
 
 - **Nothing exists at the resolved path** → `404`.
@@ -498,6 +661,20 @@ sent now lives."
   `/blog/` first means every relative link inside the page resolves
   correctly afterward. This is the same behavior nginx and Apache both
   have, for the same reason.
+  ```cpp
+  if (conn.path.empty() || conn.path[conn.path.size() - 1] != '/') {
+      std::string target = conn.path + "/";
+      if (!conn.query_string.empty())
+          target += "?" + conn.query_string;
+      conn.status_code = 301;
+      request_handler::writeResponse(conn, 301, "text/html", "",
+                                      "Location: " + target + "\r\n");
+      return;
+  }
+  ```
+  Note the query string is preserved across the redirect (`/blog?page=2`
+  becomes `/blog/?page=2`, not a bare `/blog/`) — losing it would silently
+  drop information the client explicitly asked to keep.
 - **It's a directory, and the URL *does* end in `/`** — look for the
   location's configured `index` file inside it and serve that if it
   exists; otherwise, if `autoindex` is on, generate a directory listing
@@ -533,6 +710,35 @@ Last-Modified: Tue, 22 Sep 2026 11:40:17 GMT
 <!DOCTYPE html>...
 ```
 
+...and here's the function that actually writes those lines, in order:
+
+```cpp
+void writeResponse(Connection& conn, int code, const std::string& contentType,
+                    const std::string& body, const std::string& extraHeaders) {
+    std::ostringstream out;
+    std::string version = conn.http_version.empty() ? "HTTP/1.1" : conn.http_version;
+    out << version << " " << code << " " << http_status::reasonPhrase(code) << "\r\n";
+    out << "Date: " << httpDate() << "\r\n";
+    out << "Server: webserv/1.0\r\n";
+    out << "Connection: " << (conn.keep_alive ? "keep-alive" : "close") << "\r\n";
+    if (!contentType.empty())
+        out << "Content-Type: " << contentType << "\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << extraHeaders;
+    out << "\r\n";
+    conn.write_buffer = out.str();
+    if (conn.method != "HEAD")
+        conn.write_buffer += body;
+    conn.bytes_written = 0;
+}
+```
+
+`extraHeaders` is how every one-off header gets bolted on without this
+function needing to know about every possible case — a redirect's
+`Location:`, an upload's `Location:`, a `405`'s `Allow:`, a static file's
+`Last-Modified:` are all just pre-formatted `"Name: value\r\n"` strings
+passed in from whichever caller needs them (Chapters 3-4).
+
 Two details worth calling out because they're easy to get subtly wrong:
 
 - **`HEAD` requests get every header a `GET` would, but never the body** —
@@ -561,6 +767,37 @@ whole module eventually calls. It checks, in order:
    configured still never sends back a broken, empty, or confusing
    response. The subject requires this outright: "Your server must have
    default error pages if none are provided."
+
+```cpp
+void writeErrorResponse(Connection& conn, int code, const Location* loc) {
+    if (loc) {
+        std::map<int, std::string>::const_iterator it = loc->error_pages.find(code);
+        if (it != loc->error_pages.end()) {
+            std::ifstream file(it->second.c_str(), std::ios::binary);
+            if (file.is_open()) {
+                std::ostringstream buf;
+                buf << file.rdbuf();
+                writeResponse(conn, code, http_status::mimeType(it->second), buf.str());
+                return;
+            }
+        }
+    }
+    if (conn.server_conf) {
+        std::map<int, std::string>::const_iterator it = conn.server_conf->error_pages.find(code);
+        if (it != conn.server_conf->error_pages.end()) {
+            // ...same open-and-serve pattern as above, one level less specific
+        }
+    }
+    writeResponse(conn, code, "text/html", http_status::defaultErrorBody(code));
+}
+```
+
+Each tier only falls through to the next if it *doesn't* return early —
+`loc` might be null (some rejections, like a totally unmatched URL, happen
+before a location was ever found), a configured page might not exist on
+disk, or nothing might be configured at all. Every one of those cases
+still ends up at the same last line, which is what guarantees a response
+always goes out.
 
 This is a genuinely useful design pattern beyond just this project: **most
 specific setting wins, with a sane universal fallback at the bottom**, so
@@ -761,6 +998,32 @@ checking the child's real exit status:
   default `200` when it needs to — a script can literally say "actually,
   answer this with a 226" and the server will.
 
+```cpp
+bool finish(Connection& conn, pid_t& pendingPid) {
+    pendingPid = 0;
+    if (conn.cgi_pid == -1) {
+        finishFromCgiOutput(conn, conn.cgi_out);
+        conn.state = WRITING_RESPONSE;
+        return true;
+    }
+    int status = 0;
+    pid_t reaped = waitpid(conn.cgi_pid, &status, WNOHANG);
+    if (reaped != conn.cgi_pid)
+        return false;                 // <-- the race, handled: try again next poll()
+
+    bool execFailed = WIFEXITED(status) && WEXITSTATUS(status) == 127;
+    bool crashed = WIFSIGNALED(status);
+    conn.cgi_pid = -1;
+
+    if ((execFailed || crashed) && conn.cgi_out.empty())
+        request_handler::writeErrorResponse(conn, 502);
+    else
+        finishFromCgiOutput(conn, conn.cgi_out);
+    conn.state = WRITING_RESPONSE;
+    return true;
+}
+```
+
 **A subtlety that took real debugging to get right:** a child process's
 pipes closing, and that same child becoming *reapable* via `waitpid()`, are
 **two separate events from the kernel's point of view**, and they don't
@@ -788,6 +1051,37 @@ deliberately-hanging CGI script, a second, unrelated client's plain `GET /`
 completed in well under a millisecond while the first was still waiting
 out its timeout.
 
+```cpp
+pid_t abortTimeout(Connection& conn) {
+    if (conn.cgi_pid == -1) {
+        conn.cgi_stdin_fd = -1;
+        conn.cgi_stdout_fd = -1;
+        request_handler::writeErrorResponse(conn, 504);
+        conn.state = WRITING_RESPONSE;
+        return 0;
+    }
+    conn.cgi_stdin_fd = -1;
+    conn.cgi_stdout_fd = -1;
+    kill(conn.cgi_pid, SIGKILL);
+    int status = 0;
+    pid_t reaped = waitpid(conn.cgi_pid, &status, WNOHANG);
+    pid_t pending = (reaped == conn.cgi_pid) ? 0 : conn.cgi_pid;
+    conn.cgi_pid = -1;
+
+    request_handler::writeErrorResponse(conn, 504);
+    conn.state = WRITING_RESPONSE;
+    return pending;
+}
+```
+
+Notice `SIGKILL`, not `SIGTERM`: a script that's already stuck (in an
+infinite loop, blocked on something that will never unblock) can't be
+trusted to notice and honor a polite "please stop" — `SIGKILL` can't be
+caught, blocked, or ignored, so it's guaranteed to end the process. The
+`waitpid()` right after is the same "maybe not reapable yet" situation
+from §6.6, handled the same way: if it's not ready, the pid is handed back
+to the caller as `pending` instead of blocking to wait for it.
+
 ## 6.8 — Cleaning up after: avoiding zombie processes
 
 A child process that has exited but hasn't been "acknowledged" via
@@ -795,6 +1089,13 @@ A child process that has exited but hasn't been "acknowledged" via
 **zombie** — not doing anything, but still taking up a slot, forever, until
 something reaps it. Left unchecked across thousands of requests, that's a
 slow leak that will eventually exhaust the system.
+
+```cpp
+bool reapIfExited(pid_t pid) {
+    int status = 0;
+    return waitpid(pid, &status, WNOHANG) == pid;
+}
+```
 
 The fix here is `reapIfExited()`, called opportunistically every loop
 iteration for any pid still owed a reap — always with `WNOHANG`, so it
@@ -822,6 +1123,54 @@ into memory and processes it in two passes:
    more `server { ... }` blocks at the top level, each containing
    directives and `location { ... }` blocks, each of *those* containing
    its own directives (Chapter 3.2 covers what each directive means).
+
+The tokenizer, in full — it's short enough to read as one piece:
+
+```cpp
+std::vector<std::string> tokenize(const std::string& text) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    bool inComment = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char c = text[i];
+        if (inComment) {
+            if (c == '\n')
+                inComment = false;
+            continue;
+        }
+        if (c == '#') {
+            inComment = true;
+            continue;
+        }
+        if (c == '{' || c == '}') {
+            if (!cur.empty()) {
+                tokens.push_back(cur);
+                cur.clear();
+            }
+            tokens.push_back(std::string(1, c));
+        } else if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!cur.empty()) {
+                tokens.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty())
+        tokens.push_back(cur);
+    return tokens;
+}
+```
+
+One pass, one character at a time, accumulating into `cur` until something
+ends the current token (whitespace, `{`, `}`, or a comment starting) — the
+exact same incremental-accumulation shape as `try_parse_request()` in
+Chapter 2, just over a whole file read into memory at once instead of a
+socket buffer that arrives piece by piece. `location /cgi-bin{root x}`
+(no spaces at all around the braces) tokenizes identically to the
+nicely-spaced version in §7.2, because `{`/`}` always force a token
+boundary regardless of what's touching them.
 
 **A deliberate design choice worth naming:** an unrecognized directive, or
 one with a malformed value, makes `Config::load()` `throw`. It's caught in
