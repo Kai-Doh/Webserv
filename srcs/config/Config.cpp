@@ -126,9 +126,16 @@ void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc
             while (i < tok.size() && tok[i] != "}" &&
                    !(tok[i].size() > 0 &&
                      (tok[i] == "root" || tok[i] == "index" || tok[i] == "autoindex" ||
-                      tok[i] == "return" || tok[i] == "upload_store" || tok[i] == "cgi"))) {
+                      tok[i] == "return" || tok[i] == "upload_store" || tok[i] == "cgi" ||
+                      tok[i] == "client_max_body_size"))) {
                 loc.methods.push_back(tok[i++]);
             }
+        } else if (directive == "client_max_body_size") {
+            if (i >= tok.size()) throw std::runtime_error("client_max_body_size: missing value");
+            bool ok = false;
+            long v = su::toLong(tok[i++], ok);
+            if (!ok || v < 0) throw std::runtime_error("client_max_body_size: invalid value");
+            loc.client_max_body_size = static_cast<size_t>(v);
         } else if (directive == "return") {
             if (i >= tok.size()) throw std::runtime_error("return: missing code");
             bool ok = false;

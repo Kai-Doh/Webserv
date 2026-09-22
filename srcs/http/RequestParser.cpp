@@ -287,6 +287,16 @@ bool try_parse_request(Connection& conn) {
 
     size_t maxBody = conn.server_conf ? conn.server_conf->client_max_body_size
                                        : static_cast<size_t>(-1);
+    if (conn.server_conf) {
+        // Matched early (handle_request() does its own, identical match
+        // later) purely to see whether this route overrides the body-size
+        // limit -- a location can be given a tighter one than its server
+        // to deliberately exercise 413 on a specific route.
+        const Location* earlyLoc =
+            conn.server_conf->matchLocation(collapseSlashes(su::urlDecode(rawPath)));
+        if (earlyLoc && earlyLoc->client_max_body_size != Location::NO_BODY_SIZE_OVERRIDE)
+            maxBody = earlyLoc->client_max_body_size;
+    }
 
     std::map<std::string, std::string>::const_iterator teHeader = headers.find("transfer-encoding");
     bool chunked = (teHeader != headers.end() &&
