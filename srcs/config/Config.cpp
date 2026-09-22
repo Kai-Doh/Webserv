@@ -118,7 +118,7 @@ void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc
                    !(tok[i].size() > 0 &&
                      (tok[i] == "root" || tok[i] == "index" || tok[i] == "autoindex" ||
                       tok[i] == "return" || tok[i] == "upload_store" || tok[i] == "cgi" ||
-                      tok[i] == "client_max_body_size"))) {
+                      tok[i] == "client_max_body_size" || tok[i] == "error_page"))) {
                 loc.methods.push_back(tok[i++]);
             }
         } else if (directive == "client_max_body_size") {
@@ -143,6 +143,12 @@ void parseLocation(const std::vector<std::string>& tok, size_t& i, Location& loc
             std::string ext = tok[i++];
             std::string interp = tok[i++];
             loc.cgi_extensions[ext] = interp;
+        } else if (directive == "error_page") {
+            if (i + 1 >= tok.size()) throw std::runtime_error("error_page: expected code and path");
+            bool ok = false;
+            int code = static_cast<int>(su::toLong(tok[i++], ok));
+            if (!ok) throw std::runtime_error("error_page: invalid status code");
+            loc.error_pages[code] = tok[i++];
         } else {
             throw std::runtime_error("unknown location directive: " + directive);
         }

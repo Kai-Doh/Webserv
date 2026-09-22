@@ -8,6 +8,7 @@ namespace {
 
 const size_t MAX_HEADER_SECTION = 8192;
 const size_t MAX_URI_LENGTH = 8000;
+const size_t MAX_HEADER_COUNT = 100;
 
 }
 
@@ -187,6 +188,10 @@ bool try_parse_request(Connection& conn) {
             failParse(conn, 400, bodyStart, true);
             return true;
         }
+        if (lines.size() > MAX_HEADER_COUNT + 1) {
+            failParse(conn, 431, bodyStart, true);
+            return true;
+        }
 
         std::string requestLine = su::trim(lines[0]);
         std::vector<std::string> parts = su::split(requestLine, ' ');
@@ -252,6 +257,17 @@ bool try_parse_request(Connection& conn) {
             return true;
         }
 
+        std::map<std::string, std::string>::const_iterator teCheck = headers.find("transfer-encoding");
+        bool chunkedTE = (teCheck != headers.end() &&
+                           su::toLower(teCheck->second).find("chunked") != std::string::npos);
+        if (chunkedTE && headers.find("content-length") != headers.end()) {
+            // RFC 7230 3.3.3: a message with both headers is a smuggling
+            // risk and must be rejected outright, not resolved by picking
+            // one of the two framings.
+            failParse(conn, 400, bodyStart, true);
+            return true;
+        }
+
         bool keepAlive = (version == "HTTP/1.1");
         std::map<std::string, std::string>::const_iterator connHeader = headers.find("connection");
         if (connHeader != headers.end()) {
@@ -262,8 +278,14 @@ bool try_parse_request(Connection& conn) {
                 keepAlive = true;
         }
 
+        std::string decodedPath = collapseSlashes(su::urlDecode(rawPath));
+        if (decodedPath.find('\0') != std::string::npos) {
+            failParse(conn, 400, bodyStart, true);
+            return true;
+        }
+
         conn.method = method;
-        conn.path = collapseSlashes(su::urlDecode(rawPath));
+        conn.path = decodedPath;
         conn.query_string = queryString;
         conn.http_version = version;
         conn.headers = headers;
