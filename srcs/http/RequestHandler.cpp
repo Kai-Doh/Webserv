@@ -333,6 +333,7 @@ void handle_request(Connection& conn) {
     std::string cgiInterpreter;
     std::string cgiPathInfo;
     bool isCgi = false;
+    bool cgiTargetMustExist = true;
 
     if (exists && S_ISREG(st.st_mode)) {
         std::map<std::string, std::string>::const_iterator cgiIt =
@@ -343,14 +344,31 @@ void handle_request(Connection& conn) {
             isCgi = true;
         }
     } else if (!loc->cgi_extensions.empty()) {
-        // The full path isn't a file, but a shorter prefix of it might be a
-        // CGI script with PATH_INFO trailing it (RFC 3875) -- e.g.
-        // /cgi-bin/script.py/extra/thing.
-        isCgi = resolveCgiScript(*loc, rel, cgiScriptFsPath, cgiPathInfo, cgiInterpreter);
+        std::map<std::string, std::string>::const_iterator directIt =
+            loc->cgi_extensions.find(extensionOf(fsPath));
+        if (directIt != loc->cgi_extensions.end()) {
+            // fsPath's own extension is CGI-mapped even though nothing
+            // exists there -- dispatch anyway rather than 404ing. Matches
+            // both a front-controller-style interpreter (common in real
+            // deployments) and, concretely, the official cgi_tester
+            // binary, which never touches the filesystem at all and is
+            // meant to answer for *any* .bla-suffixed path (verified live:
+            // the tester itself POSTs to a deliberately nonexistent .bla
+            // path and expects a real response, not a 404).
+            cgiScriptFsPath = fsPath;
+            cgiInterpreter = directIt->second;
+            isCgi = true;
+            cgiTargetMustExist = false;
+        } else {
+            // The full path isn't a file, but a shorter prefix of it might
+            // be a CGI script with PATH_INFO trailing it (RFC 3875) -- e.g.
+            // /cgi-bin/script.py/extra/thing.
+            isCgi = resolveCgiScript(*loc, rel, cgiScriptFsPath, cgiPathInfo, cgiInterpreter);
+        }
     }
 
     if (isCgi) {
-        if (access(cgiScriptFsPath.c_str(), R_OK) != 0) {
+        if (cgiTargetMustExist && access(cgiScriptFsPath.c_str(), R_OK) != 0) {
             request_handler::writeErrorResponse(conn, 403);
             return;
         }
@@ -362,7 +380,13 @@ void handle_request(Connection& conn) {
 
     if (conn.method == "POST") {
         if (!loc->upload_enabled) {
-            request_handler::writeErrorResponse(conn, 403);
+            // A location can allow POST without configuring upload_store --
+            // it's just not meant to persist anything (e.g. accepting a
+            // body without storing it). Acknowledge rather than reject:
+            // methodAllowed() above is what actually gates whether POST is
+            // permitted here at all.
+            conn.status_code = 200;
+            request_handler::writeResponse(conn, 200, "text/plain", "OK\n");
             return;
         }
         std::string filename = basenameOf(rel);
@@ -425,7 +449,10 @@ void handle_request(Connection& conn) {
             serveAutoindex(conn, fsPath, conn.path);
             return;
         }
-        request_handler::writeErrorResponse(conn, 403);
+        // 404, not 403: from the client's perspective there's simply no
+        // resource at this URL (matches the official 42 tester's own
+        // expectation -- verified live against it).
+        request_handler::writeErrorResponse(conn, 404);
         return;
     }
 

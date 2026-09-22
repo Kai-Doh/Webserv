@@ -29,8 +29,15 @@ struct Location {
     std::string upload_store;                    // where uploaded files are written
     std::map<std::string, std::string> cgi_extensions;  // ".py" -> "/usr/bin/python3"
 
+    // Per-location override of the server's client_max_body_size, e.g. a
+    // route deliberately given a small limit to exercise 413. Sentinel
+    // value below means "not set here -- use the server's".
+    size_t client_max_body_size;
+    static const size_t NO_BODY_SIZE_OVERRIDE = static_cast<size_t>(-1);
+
     Location()
-        : autoindex(false), redirect_code(0), upload_enabled(false) {}
+        : autoindex(false), redirect_code(0), upload_enabled(false),
+          client_max_body_size(NO_BODY_SIZE_OVERRIDE) {}
 
     bool methodAllowed(const std::string& method) const;
 };
