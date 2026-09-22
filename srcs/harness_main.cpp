@@ -141,6 +141,7 @@ void resetForNextRequest(Connection& conn) {
     conn.cgi_out.clear();
     conn.cgi_in_offset = 0;
     conn.chunked_scan_pos = 0;
+    conn.headers_ready = false;
     conn.cgi_path_info.clear();
     conn.cgi_stdin_fd = -1;
     conn.cgi_stdout_fd = -1;

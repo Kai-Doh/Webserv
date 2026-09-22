@@ -93,6 +93,20 @@ struct Connection {
     size_t cgi_in_offset;
     time_t cgi_deadline;
 
+    // ADDED (HTTP side): true once the request line + headers for the
+    // request currently being read have already been parsed into
+    // method/path/headers/etc below. try_parse_request() is called again
+    // from scratch on every partial read() while a large body is still
+    // arriving (there's no other hook for "more bytes arrived") -- without
+    // this, it would re-parse the same fixed header section from zero on
+    // every single one of those calls. Harmless for one request in
+    // isolation, but multiplied by ~4KB-chunk reads across a large body
+    // *and* many concurrent connections, that redundant work becomes the
+    // dominant cost: a live stress-test run (20 concurrent 100MB CGI
+    // POSTs) pegged one CPU core for 9+ minutes with zero forward
+    // progress until this flag was added to skip it.
+    bool headers_ready;
+
     // ADDED (HTTP side): resume point, in bytes past the start of the
     // request body, for incremental Transfer-Encoding: chunked decoding.
     // try_parse_request() is called again from scratch on every partial
@@ -109,7 +123,7 @@ struct Connection {
         : fd(-1), state(READING_REQUEST), bytes_written(0), keep_alive(true),
           last_activity(0), server_conf(0), cgi_stdin_fd(-1), cgi_stdout_fd(-1),
           cgi_pid(-1), status_code(0), cgi_in_offset(0), cgi_deadline(0),
-          chunked_scan_pos(0) {}
+          headers_ready(false), chunked_scan_pos(0) {}
 };
 
 // These two functions are the entire HTTP + CGI contract with the core

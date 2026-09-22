@@ -164,126 +164,151 @@ void failParse(Connection& conn, int code, size_t consumedBytes, bool closeConn)
 bool try_parse_request(Connection& conn) {
     std::string& buf = conn.read_buffer;
 
-    size_t headerEnd = 0;
-    size_t sepLen = 0;
-    if (!findHeaderEnd(buf, headerEnd, sepLen)) {
-        if (buf.size() > MAX_HEADER_SECTION) {
-            failParse(conn, 431, buf.size(), true);
+    if (!conn.headers_ready) {
+        size_t headerEnd = 0;
+        size_t sepLen = 0;
+        if (!findHeaderEnd(buf, headerEnd, sepLen)) {
+            if (buf.size() > MAX_HEADER_SECTION) {
+                failParse(conn, 431, buf.size(), true);
+                return true;
+            }
+            return false;  // headers not fully arrived yet
+        }
+        // The check above only catches an incomplete, still-growing header
+        // section. An oversized header section that completes in a single
+        // read() (the common case for anything short of a slow-loris-style
+        // drip feed) would otherwise sail straight past it, since
+        // findHeaderEnd() already succeeded above -- so the limit must be
+        // enforced again here, now that the header section's true length is
+        // known.
+        //
+        // The request line's own length is checked first, and separately
+        // from the overall section: an oversized URI necessarily also blows
+        // past MAX_HEADER_SECTION (a 9000-byte target alone already exceeds
+        // it), so checking section size first would always report 431 and
+        // make 414 unreachable. Checking the request line specifically
+        // first lets an overlong URI report 414, while a short URI with
+        // merely bloated headers still correctly falls through to 431
+        // below.
+        size_t firstLineEnd = buf.find('\n', 0);
+        if (firstLineEnd == std::string::npos || firstLineEnd > headerEnd)
+            firstLineEnd = headerEnd;
+        if (firstLineEnd > MAX_URI_LENGTH + 32) {  // slack for "METHOD "+" HTTP/x.y"+CR
+            failParse(conn, 414, headerEnd + sepLen, true);
             return true;
         }
-        return false;  // headers not fully arrived yet
-    }
-    // The check above only catches an incomplete, still-growing header
-    // section. An oversized header section that completes in a single
-    // read() (the common case for anything short of a slow-loris-style
-    // drip feed) would otherwise sail straight past it, since
-    // findHeaderEnd() already succeeded above -- so the limit must be
-    // enforced again here, now that the header section's true length is
-    // known.
-    //
-    // The request line's own length is checked first, and separately from
-    // the overall section: an oversized URI necessarily also blows past
-    // MAX_HEADER_SECTION (a 9000-byte target alone already exceeds it), so
-    // checking section size first would always report 431 and make 414
-    // unreachable. Checking the request line specifically first lets an
-    // overlong URI report 414, while a short URI with merely bloated
-    // headers still correctly falls through to 431 below.
-    size_t firstLineEnd = buf.find('\n', 0);
-    if (firstLineEnd == std::string::npos || firstLineEnd > headerEnd)
-        firstLineEnd = headerEnd;
-    if (firstLineEnd > MAX_URI_LENGTH + 32) {  // slack for "METHOD "+" HTTP/x.y"+CR
-        failParse(conn, 414, headerEnd + sepLen, true);
-        return true;
-    }
-    if (headerEnd > MAX_HEADER_SECTION) {
-        failParse(conn, 431, headerEnd + sepLen, true);
-        return true;
-    }
+        if (headerEnd > MAX_HEADER_SECTION) {
+            failParse(conn, 431, headerEnd + sepLen, true);
+            return true;
+        }
 
-    std::string headSection = buf.substr(0, headerEnd);
-    size_t bodyStart = headerEnd + sepLen;
+        std::string headSection = buf.substr(0, headerEnd);
+        size_t bodyStart = headerEnd + sepLen;
 
-    std::vector<std::string> lines = su::split(headSection, '\n');
-    if (lines.empty()) {
-        failParse(conn, 400, bodyStart, true);
-        return true;
-    }
-
-    // --- Request line ---
-    std::string requestLine = su::trim(lines[0]);
-    std::vector<std::string> parts = su::split(requestLine, ' ');
-    if (parts.size() != 3) {
-        failParse(conn, 400, bodyStart, true);
-        return true;
-    }
-    std::string method = parts[0];
-    std::string target = parts[1];
-    std::string version = parts[2];
-
-    if (target.size() > MAX_URI_LENGTH) {
-        failParse(conn, 414, bodyStart, true);
-        return true;
-    }
-    if (target.empty() || target[0] != '/') {
-        failParse(conn, 400, bodyStart, true);
-        return true;
-    }
-    if (!su::startsWith(version, "HTTP/")) {
-        failParse(conn, 400, bodyStart, true);
-        return true;
-    }
-    if (version != "HTTP/1.1" && version != "HTTP/1.0") {
-        failParse(conn, 505, bodyStart, true);
-        return true;
-    }
-
-    std::string rawPath = target;
-    std::string queryString;
-    size_t qpos = target.find('?');
-    if (qpos != std::string::npos) {
-        rawPath = target.substr(0, qpos);
-        queryString = target.substr(qpos + 1);
-    }
-
-    // --- Headers ---
-    std::map<std::string, std::string> headers;
-    for (size_t i = 1; i < lines.size(); ++i) {
-        std::string line = su::trim(lines[i]);
-        if (line.empty())
-            continue;
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) {
+        std::vector<std::string> lines = su::split(headSection, '\n');
+        if (lines.empty()) {
             failParse(conn, 400, bodyStart, true);
             return true;
         }
-        std::string key = su::toLower(su::trim(line.substr(0, colon)));
-        std::string value = su::trim(line.substr(colon + 1));
-        std::map<std::string, std::string>::iterator existing = headers.find(key);
-        if (existing != headers.end()) {
-            if (key == "content-length" && existing->second != value) {
-                failParse(conn, 400, bodyStart, true);  // conflicting lengths: possible smuggling
+
+        // --- Request line ---
+        std::string requestLine = su::trim(lines[0]);
+        std::vector<std::string> parts = su::split(requestLine, ' ');
+        if (parts.size() != 3) {
+            failParse(conn, 400, bodyStart, true);
+            return true;
+        }
+        std::string method = parts[0];
+        std::string target = parts[1];
+        std::string version = parts[2];
+
+        if (target.size() > MAX_URI_LENGTH) {
+            failParse(conn, 414, bodyStart, true);
+            return true;
+        }
+        if (target.empty() || target[0] != '/') {
+            failParse(conn, 400, bodyStart, true);
+            return true;
+        }
+        if (!su::startsWith(version, "HTTP/")) {
+            failParse(conn, 400, bodyStart, true);
+            return true;
+        }
+        if (version != "HTTP/1.1" && version != "HTTP/1.0") {
+            failParse(conn, 505, bodyStart, true);
+            return true;
+        }
+
+        std::string rawPath = target;
+        std::string queryString;
+        size_t qpos = target.find('?');
+        if (qpos != std::string::npos) {
+            rawPath = target.substr(0, qpos);
+            queryString = target.substr(qpos + 1);
+        }
+
+        // --- Headers ---
+        std::map<std::string, std::string> headers;
+        for (size_t i = 1; i < lines.size(); ++i) {
+            std::string line = su::trim(lines[i]);
+            if (line.empty())
+                continue;
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) {
+                failParse(conn, 400, bodyStart, true);
                 return true;
             }
-            existing->second = value;
-        } else {
-            headers[key] = value;
+            std::string key = su::toLower(su::trim(line.substr(0, colon)));
+            std::string value = su::trim(line.substr(colon + 1));
+            std::map<std::string, std::string>::iterator existing = headers.find(key);
+            if (existing != headers.end()) {
+                if (key == "content-length" && existing->second != value) {
+                    failParse(conn, 400, bodyStart, true);  // conflicting lengths: possible smuggling
+                    return true;
+                }
+                existing->second = value;
+            } else {
+                headers[key] = value;
+            }
         }
+
+        if (version == "HTTP/1.1" && headers.find("host") == headers.end()) {
+            failParse(conn, 400, bodyStart, true);
+            return true;
+        }
+
+        bool keepAlive = (version == "HTTP/1.1");
+        std::map<std::string, std::string>::const_iterator connHeader = headers.find("connection");
+        if (connHeader != headers.end()) {
+            std::string v = su::toLower(connHeader->second);
+            if (v.find("close") != std::string::npos)
+                keepAlive = false;
+            else if (v.find("keep-alive") != std::string::npos)
+                keepAlive = true;
+        }
+
+        // Commit and stop redoing this work: every later call for this same
+        // request (there can be thousands while a large body streams in)
+        // takes the `if (!conn.headers_ready)` branch above and skips
+        // straight past it, reading these back out of conn instead.
+        conn.method = method;
+        conn.path = collapseSlashes(su::urlDecode(rawPath));
+        conn.query_string = queryString;
+        conn.http_version = version;
+        conn.headers = headers;
+        conn.keep_alive = keepAlive;
+        conn.headers_ready = true;
     }
 
-    if (version == "HTTP/1.1" && headers.find("host") == headers.end()) {
-        failParse(conn, 400, bodyStart, true);
-        return true;
-    }
-
-    bool keepAlive = (version == "HTTP/1.1");
-    std::map<std::string, std::string>::const_iterator connHeader = headers.find("connection");
-    if (connHeader != headers.end()) {
-        std::string v = su::toLower(connHeader->second);
-        if (v.find("close") != std::string::npos)
-            keepAlive = false;
-        else if (v.find("keep-alive") != std::string::npos)
-            keepAlive = true;
-    }
+    // Cheap to redo every call: the separator sits right after the small,
+    // fixed header section regardless of how much body trails it, and
+    // read_buffer is never truncated before the whole request is consumed
+    // -- so this stays valid across every call for this request. Guaranteed
+    // to succeed: conn.headers_ready true means it already did once.
+    size_t headerEnd = 0;
+    size_t sepLen = 0;
+    findHeaderEnd(buf, headerEnd, sepLen);
+    size_t bodyStart = headerEnd + sepLen;
 
     size_t maxBody = conn.server_conf ? conn.server_conf->client_max_body_size
                                        : static_cast<size_t>(-1);
@@ -292,14 +317,13 @@ bool try_parse_request(Connection& conn) {
         // later) purely to see whether this route overrides the body-size
         // limit -- a location can be given a tighter one than its server
         // to deliberately exercise 413 on a specific route.
-        const Location* earlyLoc =
-            conn.server_conf->matchLocation(collapseSlashes(su::urlDecode(rawPath)));
+        const Location* earlyLoc = conn.server_conf->matchLocation(conn.path);
         if (earlyLoc && earlyLoc->client_max_body_size != Location::NO_BODY_SIZE_OVERRIDE)
             maxBody = earlyLoc->client_max_body_size;
     }
 
-    std::map<std::string, std::string>::const_iterator teHeader = headers.find("transfer-encoding");
-    bool chunked = (teHeader != headers.end() &&
+    std::map<std::string, std::string>::const_iterator teHeader = conn.headers.find("transfer-encoding");
+    bool chunked = (teHeader != conn.headers.end() &&
                     su::toLower(teHeader->second).find("chunked") != std::string::npos);
 
     std::string body;
@@ -346,8 +370,8 @@ bool try_parse_request(Connection& conn) {
         conn.chunked_scan_pos = 0;  // ready for the next request on this connection
         buf.erase(0, bodyStart + totalConsumed);
     } else {
-        std::map<std::string, std::string>::const_iterator clHeader = headers.find("content-length");
-        if (clHeader != headers.end()) {
+        std::map<std::string, std::string>::const_iterator clHeader = conn.headers.find("content-length");
+        if (clHeader != conn.headers.end()) {
             bool ok = false;
             long len = su::toLong(clHeader->second, ok);
             if (!ok || len < 0) {
@@ -372,13 +396,8 @@ bool try_parse_request(Connection& conn) {
         }
     }
 
-    conn.method = method;
-    conn.path = collapseSlashes(su::urlDecode(rawPath));
-    conn.query_string = queryString;
-    conn.http_version = version;
-    conn.headers = headers;
     conn.body = body;
-    conn.keep_alive = keepAlive;
     conn.status_code = 0;
+    conn.headers_ready = false;  // done with this request; next call starts fresh
     return true;
 }
