@@ -315,6 +315,62 @@ seeing exactly what it could get away with:
   principle both times: when two trusted signals disagree, don't guess
   which one to believe — refuse the request outright.
 
+A third batch of hardening checks lives here too, added after deliberately
+trying to construct requests that would *look* almost fine and see what
+survived:
+
+- **A second `Host` header → `400`, whether or not the two values agree.**
+  RFC 7230 §5.4 doesn't just forbid *conflicting* `Host` headers, it
+  forbids *more than one*, full stop — a request with two identical `Host`
+  headers is still ambiguous about which one a downstream system is
+  supposed to trust, so this checks for the second occurrence outright
+  rather than waiting to see if the values happen to differ:
+  ```cpp
+  if (key == "host" && headers.find("host") != headers.end()) {
+      failParse(conn, 400, bodyStart, true);
+      return true;
+  }
+  ```
+- **Whitespace between a header name and its colon → `400`.** `X-Foo :
+  bar` (note the space before `:`) is, per RFC 7230 §3.2.4, something a
+  server **must** reject outright — not because it's ambiguous *here*, but
+  because different implementations disagree on whether that space is
+  part of the field name or not. If this server quietly stripped it while
+  something in front of it (a reverse proxy) didn't, the two could
+  disagree about whether a header even matches a given name — the same
+  smuggling-shaped problem as the two checks above, just one character
+  wide:
+  ```cpp
+  if (colon > 0 && (line[colon - 1] == ' ' || line[colon - 1] == '\t')) {
+      failParse(conn, 400, bodyStart, true);
+      return true;
+  }
+  ```
+- **Two headers that collide once mapped to a CGI environment variable →
+  `400`.** `buildEnv()` (Chapter 6) turns every header into an `HTTP_`
+  env var per RFC 3875, converting `-` to `_` along the way — which means
+  a client-sent `X-Foo` and a client-sent `X_Foo` both become the exact
+  same `HTTP_X_FOO`. Left unchecked, both would sit in `conn.headers`
+  under their own distinct keys, both would get pushed into the CGI
+  child's `envp`, and *which value a script's `getenv()` actually sees*
+  would come down to `std::map`'s iteration order — an implementation
+  accident, not something either header's sender could predict or rely
+  on. Caught the same way as a duplicate `Content-Length`, just keyed on
+  the post-normalization name instead of the literal one:
+  ```cpp
+  std::string envName = key;
+  for (size_t k = 0; k < envName.size(); ++k) {
+      if (envName[k] == '-')
+          envName[k] = '_';
+  }
+  std::map<std::string, std::string>::const_iterator envIt = envNames.find(envName);
+  if (envIt != envNames.end() && envIt->second != key) {
+      failParse(conn, 400, bodyStart, true);
+      return true;
+  }
+  envNames[envName] = key;
+  ```
+
 ## 2.4 — Caching what we've learned: `headers_ready`
 
 Here's where the "called again and again" nature from Chapter 1 really
@@ -390,6 +446,31 @@ chunk on each call. This was the *other* half of that same O(n²) bug: the
 chunked decoder was originally re-copying the entire body-so-far into
 `conn.body` on every partial read too. Same disease, same cure: cache the
 position, never redo already-finished work.
+
+Each chunk-size line is hex text, parsed with `std::strtol()` — and
+`strtol()` has a quiet failure mode worth guarding against explicitly: on
+a value too large to fit in a `long` (a client sending, say, `ffffffffffffffff`
+as a chunk size), it doesn't fail loudly — it clamps to `LONG_MAX` and
+sets `errno = ERANGE`, leaving the return value looking like a perfectly
+ordinary large-but-valid number. Without checking `errno`, that "clamped"
+size would be accepted as genuine, and the parser would then sit waiting
+for a chunk body of a preposterous, functionally-unreachable size — not
+an infinite hang (the raw-buffer size guard just below and the 60-second
+idle timeout both eventually catch it), but a real delay for something
+that should just be `400` immediately:
+```cpp
+char* endptr = 0;
+errno = 0;
+long chunkSizeLong = std::strtol(sizeLine.c_str(), &endptr, 16);
+if (endptr == sizeLine.c_str() || *endptr != '\0' || chunkSizeLong < 0 || errno == ERANGE) {
+    malformed = true;
+    return false;
+}
+```
+This is the one place in the whole codebase that checks `errno` after
+anything — and it's checked after a `strtol()` call on an already-fully-
+buffered string, never after a `read()`/`write()`/`recv()`/`send()`, which
+the subject explicitly forbids using `errno` to drive behavior around.
 
 Whichever method is used, the result is checked against
 `client_max_body_size` (the server's configured limit, or a more specific
@@ -843,7 +924,7 @@ nothing ever falls through to "undefined behavior."
 | 431 | Request Header Fields Too Large — too many headers, or the header section itself too big |
 | 500 | Internal Server Error — something failed on *our* side (e.g. couldn't open a file to write an upload) |
 | 501 | Not Implemented — a method this server doesn't recognize at all |
-| 502 | Bad Gateway — a CGI script failed to even start, or crashed with no output |
+| 502 | Bad Gateway — a CGI script failed to even start, exited nonzero with no output, or was killed by a signal (output or not) |
 | 504 | Gateway Timeout — a CGI script ran past its time limit |
 | 505 | HTTP Version Not Supported |
 
@@ -1015,9 +1096,16 @@ checking the child's real exit status:
   printing anything — and that's just as much "nothing usable to send
   back" as an execve() failure is, so both collapse to the same check:
   nonzero exit, empty stdout.
-- **Killed by a signal** (a segfault, for instance) *and* produced no
-  output → also **`502`** — something genuinely broke, and there's nothing
-  usable to send back.
+- **Killed by a signal** (a segfault, for instance) → **always `502`**,
+  *regardless of whether it had already printed something first*. This
+  is stricter than the nonzero-exit case above on purpose: a signal kill
+  is never a legitimate way for a script to finish, so partial output
+  doesn't get the benefit of the doubt. Trusting it would mean serving a
+  silently truncated response — valid-looking headers plus half a body —
+  as a normal `200`, with nothing to tell a client the script never
+  actually completed. (This was a real, verified bug: a script that wrote
+  full headers plus part of a body and then `os.abort()`'d used to come
+  back as a clean, if short, `200 OK`.)
 - **Otherwise** — even a script that exits with a nonzero status but *did*
   print a valid response — its output is trusted and forwarded as-is via
   `finishFromCgiOutput()`. A CGI script's own **`Status:`** header (if it
@@ -1043,7 +1131,7 @@ bool finish(Connection& conn, pid_t& pendingPid) {
     bool crashed = WIFSIGNALED(status);
     conn.cgi_pid = -1;
 
-    if ((failedExit || crashed) && conn.cgi_out.empty())
+    if (crashed || (failedExit && conn.cgi_out.empty()))
         request_handler::writeErrorResponse(conn, 502);
     else
         finishFromCgiOutput(conn, conn.cgi_out);
@@ -1051,6 +1139,39 @@ bool finish(Connection& conn, pid_t& pendingPid) {
     return true;
 }
 ```
+
+Notice `crashed` sits *outside* the `&& conn.cgi_out.empty()` check that
+`failedExit` is still gated by — that asymmetry is the whole fix. A
+nonzero exit with real output on stdout is still trusted (a script can
+legitimately `sys.exit(1)` after printing a complete, valid response); a
+signal kill never is, output or not.
+
+`finishFromCgiOutput()` itself is also deliberately selective about which
+of the script's own headers it forwards. `Status:` and `Content-Type:`
+are read and honored, as above; but `Content-Length`, `Date`, `Server`,
+and `Connection` are silently **dropped**, not forwarded:
+
+```cpp
+} else if (lowerKey == "content-length" || lowerKey == "date" ||
+           lowerKey == "server" || lowerKey == "connection") {
+    // writeResponse() always writes its own correct version of each of
+    // these -- the real Content-Length computed from the actual body,
+    // our own Date/Server, the connection's own keep-alive decision.
+    // Forwarding the script's version too would put two of the same
+    // header on the wire.
+} else {
+    extraHeaders += key + ": " + value + "\r\n";
+}
+```
+
+Without this, a script that set its own (correct or not) `Content-Length`
+header would end up on the wire *twice* — `writeResponse()`'s own
+correctly-computed one, plus the script's, verbatim, as an "extra"
+header. Two `Content-Length` headers in one response is exactly the kind
+of framing ambiguity RFC 7230 says a server must never produce, and
+exactly the same category of problem the request-parsing side already
+guards against for *incoming* requests (§2.3) — just discovered on the
+way out instead of the way in.
 
 **A subtlety that took real debugging to get right:** a child process's
 pipes closing, and that same child becoming *reapable* via `waitpid()`, are
