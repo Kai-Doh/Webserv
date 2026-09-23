@@ -155,6 +155,15 @@ void finishFromCgiOutput(Connection& conn, const std::string& raw) {
                 statusCode = static_cast<int>(code);
         } else if (lowerKey == "content-type") {
             contentType = value;
+        } else if (lowerKey == "content-length" || lowerKey == "date" ||
+                   lowerKey == "server" || lowerKey == "connection") {
+            // These are always written by writeResponse() itself (the real
+            // Content-Length computed from the actual body, our own
+            // Date/Server, and the connection's own keep-alive decision) --
+            // trusting a script's version too would put two of the same
+            // header on the wire, which is exactly the kind of framing
+            // ambiguity the request side already rejects outright (TE +
+            // Content-Length together, see RequestParser.cpp).
         } else {
             extraHeaders += key + ": " + value + "\r\n";
         }
@@ -312,12 +321,15 @@ bool isDone(const Connection& conn) {
 /**
  * @brief Assembles the final response once both CGI pipes are closed.
  *
- * A single non-blocking waitpid() tells an execve() failure (exit 127, no
- * output -> 502) apart from a script that legitimately said nothing (->
- * 200). Since pipes closing and the child becoming reapable are two
- * separate kernel events, the child can briefly still be un-reapable right
- * after EOF -- in that case this changes nothing and returns false so the
- * caller retries on a later poll() iteration instead of guessing 200.
+ * A single non-blocking waitpid() tells any failed exit (nonzero status --
+ * whether that's the execve() failure convention of exit 127, a crash, or
+ * a script erroring out with no output, e.g. a Python syntax error) apart
+ * from a script that legitimately exited 0 and said nothing (-> 200), and
+ * maps the former to 502. Since pipes closing and the child becoming
+ * reapable are two separate kernel events, the child can briefly still be
+ * un-reapable right after EOF -- in that case this changes nothing and
+ * returns false so the caller retries on a later poll() iteration instead
+ * of guessing 200.
  *
  * @param conn       Connection whose CGI just finished.
  * @param pendingPid Set to a pid that still needs reapIfExited() later, or 0.
@@ -335,11 +347,16 @@ bool finish(Connection& conn, pid_t& pendingPid) {
     if (reaped != conn.cgi_pid)
         return false;
 
-    bool execFailed = WIFEXITED(status) && WEXITSTATUS(status) == 127;
+    bool failedExit = WIFEXITED(status) && WEXITSTATUS(status) != 0;
     bool crashed = WIFSIGNALED(status);
     conn.cgi_pid = -1;
 
-    if ((execFailed || crashed) && conn.cgi_out.empty())
+    // A signal kill is never a legitimate way for a script to finish, so it's
+    // fatal regardless of whether it managed to flush some output first --
+    // trusting partial output here would mean serving a truncated response
+    // (say, valid headers plus half a body) that looks like a normal 200 to
+    // the client, with no sign the script never actually finished.
+    if (crashed || (failedExit && conn.cgi_out.empty()))
         request_handler::writeErrorResponse(conn, 502);
     else
         finishFromCgiOutput(conn, conn.cgi_out);

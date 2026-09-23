@@ -1,0 +1,8 @@
+http://127.0.0.1:8080/
+http://127.0.0.1:8080/listing/
+http://127.0.0.1:8080/listing/a.txt
+http://127.0.0.1:8080/about.html
+http://127.0.0.1:8080/does-not-exist
+http://127.0.0.1:8080/cgi-bin/hello.py?name=siege
+http://127.0.0.1:8080/cgi-bin/hello.py
+http://127.0.0.1:8080/old

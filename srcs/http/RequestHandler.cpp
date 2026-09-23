@@ -201,6 +201,20 @@ bool isKnownMethod(const std::string& method) {
            method == "PATCH";
 }
 
+/**
+ * @brief Real HTTP methods the subject never asks for (only GET/POST/DELETE
+ *        are required) and that this server has no actual handling for --
+ *        PUT/PATCH would otherwise silently fall through to the same
+ *        static-file logic as GET (serving the target, ignoring the body),
+ *        and OPTIONS has no real "describe this resource" response. Checked
+ *        unconditionally, ahead of loc->methodAllowed(), so a location
+ *        config that mistakenly lists one of these still 405s instead of
+ *        reaching that broken fallthrough.
+ */
+bool isUnsupportedMethod(const std::string& method) {
+    return method == "PUT" || method == "OPTIONS" || method == "PATCH";
+}
+
 }
 
 namespace request_handler {
@@ -315,7 +329,7 @@ void handle_request(Connection& conn) {
         return;
     }
 
-    if (!loc->methodAllowed(conn.method)) {
+    if (isUnsupportedMethod(conn.method) || !loc->methodAllowed(conn.method)) {
         if (!isKnownMethod(conn.method)) {
             conn.status_code = 501;
             request_handler::writeErrorResponse(conn, 501, loc);
@@ -323,9 +337,11 @@ void handle_request(Connection& conn) {
         }
         std::string allow;
         for (size_t i = 0; i < loc->methods.size(); ++i) {
-            allow += loc->methods[i];
-            if (i + 1 < loc->methods.size())
+            if (isUnsupportedMethod(loc->methods[i]))
+                continue;
+            if (!allow.empty())
                 allow += ", ";
+            allow += loc->methods[i];
         }
         conn.status_code = 405;
         request_handler::writeResponse(conn, 405, "text/html", http_status::defaultErrorBody(405),

@@ -3,6 +3,7 @@
 #include "utils/StringUtils.hpp"
 #include <cstdlib>
 #include <cctype>
+#include <cerrno>
 
 namespace {
 
@@ -35,8 +36,9 @@ bool decodeChunked(Connection& conn, size_t bodyStart, size_t& totalConsumed, bo
         }
 
         char* endptr = 0;
+        errno = 0;
         long chunkSizeLong = std::strtol(sizeLine.c_str(), &endptr, 16);
-        if (endptr == sizeLine.c_str() || *endptr != '\0' || chunkSizeLong < 0) {
+        if (endptr == sizeLine.c_str() || *endptr != '\0' || chunkSizeLong < 0 || errno == ERANGE) {
             malformed = true;
             return false;
         }
@@ -229,6 +231,7 @@ bool try_parse_request(Connection& conn) {
         }
 
         std::map<std::string, std::string> headers;
+        std::map<std::string, std::string> envNames;
         for (size_t i = 1; i < lines.size(); ++i) {
             std::string line = su::trim(lines[i]);
             if (line.empty())
@@ -238,8 +241,44 @@ bool try_parse_request(Connection& conn) {
                 failParse(conn, 400, bodyStart, true);
                 return true;
             }
+            // RFC 7230 3.2.4: no whitespace is allowed between the field
+            // name and the colon -- some implementations strip it silently,
+            // others don't, and that disagreement is a known request-
+            // smuggling vector when this server sits behind a proxy with
+            // different rules. Reject outright rather than guess.
+            if (colon > 0 && (line[colon - 1] == ' ' || line[colon - 1] == '\t')) {
+                failParse(conn, 400, bodyStart, true);
+                return true;
+            }
             std::string key = su::toLower(su::trim(line.substr(0, colon)));
             std::string value = su::trim(line.substr(colon + 1));
+
+            // RFC 7230 5.4: a request with more than one Host header, or
+            // with an ambiguous Host, must be rejected -- not just quietly
+            // resolved by keeping the last one.
+            if (key == "host" && headers.find("host") != headers.end()) {
+                failParse(conn, 400, bodyStart, true);
+                return true;
+            }
+
+            // buildEnv() turns every header into an HTTP_ env var for CGI,
+            // mapping '-' to '_' (RFC 3875 convention) -- so distinct
+            // headers like "X-Foo" and "X_Foo" would otherwise collide into
+            // the same HTTP_X_FOO env var, and which one a CGI script's
+            // getenv() actually sees becomes an implementation accident
+            // rather than something either header sender could predict.
+            std::string envName = key;
+            for (size_t k = 0; k < envName.size(); ++k) {
+                if (envName[k] == '-')
+                    envName[k] = '_';
+            }
+            std::map<std::string, std::string>::const_iterator envIt = envNames.find(envName);
+            if (envIt != envNames.end() && envIt->second != key) {
+                failParse(conn, 400, bodyStart, true);
+                return true;
+            }
+            envNames[envName] = key;
+
             std::map<std::string, std::string>::iterator existing = headers.find(key);
             if (existing != headers.end()) {
                 if (key == "content-length" && existing->second != value) {

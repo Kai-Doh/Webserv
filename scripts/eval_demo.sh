@@ -128,6 +128,13 @@ demo_cgi() {
     expected "hello.py and echo.py run as real child processes through python3 and return normal 200s (echo.py reflects the POSTed body back). anything.broken points at a deliberately bogus interpreter -- execve fails in the child, which maps to 502 Bad Gateway, not a hang or a crash."
 }
 
+demo_cgi_syntax_error() {
+    section "CGI script with a Python syntax error"
+    ours
+    run curl -si "$BASE1/cgi-bin/syntax_error.py"
+    expected "python3 finds the interpreter fine (unlike anything.broken) but exits 1 with only a traceback on stderr -- stdout is empty. finish() treats any nonzero exit status with empty output as a failed CGI, the same bucket execve failure (exit 127) and signal crashes fall into -- 502 Bad Gateway, not a silent 200."
+}
+
 demo_concurrency() {
     section "Concurrent clients don't block each other"
     ours
@@ -157,8 +164,104 @@ run_all() {
     demo_upload_cycle
     demo_unknown_method
     demo_cgi
+    demo_cgi_syntax_error
     demo_concurrency
     demo_health
+    demo_sneaky_403
+    demo_sneaky_400
+    demo_sneaky_502
+    demo_sneaky_405
+    demo_sneaky_cgi_response
+}
+
+# ---- sneaky / adversarial error-code tests ----------------------------------
+#
+# Everything below was invented while specifically hunting for requests that
+# LOOK like they should be fine but actually hide a bug -- a CGI crash that
+# still manages to flush a plausible-looking response, a header collision
+# that silently picks a winner, a duplicate Host header nobody rejected.
+# Several of these can't be sent with curl at all (it normalizes ".." out of
+# URLs before the request ever leaves the client, and there's no curl flag
+# for "send two Host headers" or "put a space before this colon"), so they
+# go straight to a raw socket via raw_request.py instead.
+
+demo_sneaky_403() {
+    section "Sneaky 403s: path traversal & permission-denied"
+    ours
+    echo "-- plain path traversal (raw socket -- curl would silently normalize this away) --"
+    run bash -c "printf 'GET /../../../etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- traversal starting from inside a real location --"
+    run bash -c "printf 'GET /listing/../../../etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- URL-encoded traversal (%2f = /) --"
+    run bash -c "printf 'GET /..%%2f..%%2f..%%2fetc%%2fpasswd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- double-encoded (%252f) -- NOT a bypass: single-decode leaves it a literal filename, so this one's an honest 404, not 403 --"
+    run bash -c "printf 'GET /..%%252f..%%252fetc%%252fpasswd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- self-canceling traversal that would land back in-bounds (still blocked, on purpose) --"
+    run bash -c "printf 'GET /listing/../listing/a.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- traversal via CGI PATH_INFO, past a real script --"
+    run bash -c "printf 'GET /cgi-bin/hello.py/../../../../etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- traversal on DELETE, not just GET --"
+    run bash -c "printf 'DELETE /upload/../../../../etc/passwd HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- permission-denied: a real file, chmod 000 (reverted right after) --"
+    chmod 000 www/listing/a.txt
+    run curl -si "$BASE1/listing/a.txt"
+    chmod 644 www/listing/a.txt
+    echo "-- permission-denied: a real CGI script, chmod 000 (reverted right after) --"
+    chmod 000 www/cgi-bin/hello.py
+    run curl -si "$BASE1/cgi-bin/hello.py"
+    chmod 644 www/cgi-bin/hello.py
+    expected "Every traversal attempt -- plain, encoded, from a subdirectory, self-canceling, through CGI PATH_INFO, on DELETE -- is 403, verified on a raw socket so curl's own URL normalization can't hide a false pass. The double-encoded one is deliberately 404, not 403: single-decode means %252f never becomes a real '/', so there's no segment to catch -- proving there's no double-decode bypass, not exposing one. Permission-denied files/scripts are 403, not a crash or a silent 200."
+}
+
+demo_sneaky_400() {
+    section "Sneaky 400s: malformed and ambiguous requests"
+    ours
+    echo "-- null byte smuggled into the path --"
+    run curl -si "$BASE1/index.html%00.jpg"
+    echo "-- two DIFFERENT Host headers on one request --"
+    run bash -c "printf 'GET / HTTP/1.1\r\nHost: localhost\r\nHost: evil.example.com\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- two IDENTICAL Host headers (RFC 7230 5.4: any duplicate is invalid, not just a disagreement) --"
+    run bash -c "printf 'GET / HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- whitespace between a header name and its colon (RFC 7230 3.2.4 smuggling guard) --"
+    run bash -c "printf 'POST /upload/x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding : chunked\r\n\r\n0\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- two headers that collide into the same CGI env var (X-Foo / X_Foo -> both HTTP_X_FOO) --"
+    run bash -c "printf 'GET /cgi-bin/echo_header.py HTTP/1.1\r\nHost: localhost\r\nX-Foo: from-dash\r\nX_Foo: from-underscore\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- negative chunk size --"
+    run bash -c "printf 'POST /upload/x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- chunk-size hex value that overflows strtol (used to hang silently instead of failing) --"
+    run bash -c "printf 'POST /upload/x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n' | python3 scripts/raw_request.py"
+    expected "Every one of these looks almost fine -- a stray null byte, a duplicate header, one extra space, two header names differing only by '-' vs '_' -- and every one is 400: not silently accepted, not ambiguously resolved by picking a winner, not a multi-second hang waiting for data that will never arrive."
+}
+
+demo_sneaky_502() {
+    section "Sneaky 502s: CGI failures that don't look like failures"
+    ours
+    echo "-- CGI dies by signal before writing anything --"
+    run curl -si "$BASE1/cgi-bin/crash_silent.py"
+    echo "-- CGI writes valid headers + a partial body, THEN dies by signal (the sneaky one) --"
+    run curl -si "$BASE1/cgi-bin/crash_partial.py"
+    echo "-- request for a CGI script that doesn't exist on disk at all --"
+    run curl -si "$BASE1/cgi-bin/does-not-exist.py"
+    expected "crash_silent.py and crash_partial.py die the exact same way (SIGABRT) -- the only difference is crash_partial.py manages to flush a plausible-looking response first. A signal kill is always fatal regardless of what it already wrote, so both are 502; before that fix, crash_partial.py looked like a normal, if short, 200. A CGI extension whose script file is simply missing also 502s rather than silently returning an empty 200."
+}
+
+demo_sneaky_405() {
+    section "Sneaky 405s: PUT/OPTIONS/PATCH never allowed, anywhere"
+    ours
+    run curl -si -X PUT --data "x" "$BASE1/index.html"
+    run curl -si -X OPTIONS "$BASE1/"
+    run curl -si -X PATCH --data "x" "$BASE1/upload/x"
+    expected "PUT/OPTIONS/PATCH are real HTTP methods the subject never asks for, so they're rejected unconditionally -- not just because no location's config happens to allow them today, but because the server has no real handling for them at all (they'd otherwise silently fall through to GET-like static-file serving, body ignored). Allow: never lists them either, even if a config mistakenly did."
+}
+
+demo_sneaky_cgi_response() {
+    section "Sneaky CGI response hygiene"
+    ours
+    echo "-- CGI script sets its OWN (wrong) Content-Length header --"
+    run bash -c "printf 'GET /cgi-bin/lie_length.py HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | python3 scripts/raw_request.py"
+    echo "-- sanity check: a single X-Foo header (no collision) still reaches the CGI normally --"
+    run curl -s -H "X-Foo: only-one" "$BASE1/cgi-bin/echo_header.py"
+    expected "lie_length.py's own bogus Content-Length: 999999 is dropped -- only the server's correctly-computed Content-Length (matching the real 2-byte body) makes it onto the wire, not both. The single-header sanity check confirms the earlier 400 (two colliding headers) isn't refusing ALL custom headers -- one on its own still passes straight through to the CGI environment."
 }
 
 # ---- menu -------------------------------------------------------------------
@@ -175,8 +278,14 @@ print_menu() {
  7) Upload, download, and delete a file
  8) Unknown HTTP methods
  9) CGI execution and environment
-10) Concurrent clients don't block each other
-11) Process health check
+10) CGI script with a Python syntax error
+11) Concurrent clients don't block each other
+12) Process health check
+13) Sneaky 403s: path traversal & permission-denied
+14) Sneaky 400s: malformed and ambiguous requests
+15) Sneaky 502s: CGI failures that don't look like failures
+16) Sneaky 405s: PUT/OPTIONS/PATCH never allowed
+17) Sneaky CGI response hygiene
  a) Run everything
  q) Quit
 EOF
@@ -200,8 +309,14 @@ while true; do
         7) check_running && demo_upload_cycle ;;
         8) check_running && demo_unknown_method ;;
         9) check_running && demo_cgi ;;
-        10) check_running && demo_concurrency ;;
-        11) check_running && demo_health ;;
+        10) check_running && demo_cgi_syntax_error ;;
+        11) check_running && demo_concurrency ;;
+        12) check_running && demo_health ;;
+        13) check_running && demo_sneaky_403 ;;
+        14) check_running && demo_sneaky_400 ;;
+        15) check_running && demo_sneaky_502 ;;
+        16) check_running && demo_sneaky_405 ;;
+        17) check_running && demo_sneaky_cgi_response ;;
         "") ;;
         *) echo "Unknown choice: $choice" ;;
     esac

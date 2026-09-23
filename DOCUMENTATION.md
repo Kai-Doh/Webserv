@@ -540,18 +540,34 @@ location's allowed set, gets the more specific `405`, along with an
 `Allow:` header listing what actually *is* permitted — which is itself a
 spec requirement (RFC 7231 §6.5.5), not just a nicety.
 
+A second, narrower list — `isUnsupportedMethod()` — covers `PUT`,
+`OPTIONS`, and `PATCH` specifically: real HTTP methods (so still `405`,
+never `501`), but ones the subject never asks for and that this server has
+no actual handling for. Without this guard, a location config that
+mistakenly listed one of them as allowed would fall straight through
+`handle_request()`'s method branch into the same logic as `GET` — serving
+the target file back and silently ignoring the request body, which is not
+`PUT`/`PATCH` semantics at all, and `OPTIONS` has no real "describe this
+resource" response either. `isUnsupportedMethod()` is checked *before*
+`loc->methodAllowed()`, so these three always 405 regardless of what any
+config says:
+
 ```cpp
 bool isKnownMethod(const std::string& method) {
     return method == "GET" || method == "POST" || method == "DELETE" ||
            method == "HEAD" || method == "PUT" || method == "OPTIONS" ||
            method == "PATCH";
 }
+
+bool isUnsupportedMethod(const std::string& method) {
+    return method == "PUT" || method == "OPTIONS" || method == "PATCH";
+}
 ```
 
-and the actual branch in `handle_request()` that uses it:
+and the actual branch in `handle_request()` that uses them:
 
 ```cpp
-if (!loc->methodAllowed(conn.method)) {
+if (isUnsupportedMethod(conn.method) || !loc->methodAllowed(conn.method)) {
     if (!isKnownMethod(conn.method)) {
         conn.status_code = 501;
         request_handler::writeErrorResponse(conn, 501, loc);
@@ -559,9 +575,11 @@ if (!loc->methodAllowed(conn.method)) {
     }
     std::string allow;
     for (size_t i = 0; i < loc->methods.size(); ++i) {
-        allow += loc->methods[i];
-        if (i + 1 < loc->methods.size())
+        if (isUnsupportedMethod(loc->methods[i]))
+            continue;
+        if (!allow.empty())
             allow += ", ";
+        allow += loc->methods[i];
     }
     conn.status_code = 405;
     request_handler::writeResponse(conn, 405, "text/html", http_status::defaultErrorBody(405),
@@ -569,6 +587,10 @@ if (!loc->methodAllowed(conn.method)) {
     return;
 }
 ```
+
+The `Allow:` header is filtered through the same `isUnsupportedMethod()`
+check, so even a config that lists `PUT` never advertises it as available
+— the header stays truthful about what the server will actually do.
 
 Notice the order: `isKnownMethod()` is only even consulted *after*
 `loc->methodAllowed()` already said no. A method the location genuinely
@@ -984,9 +1006,15 @@ has stopped talking — it doesn't yet say whether the script *succeeded*.
 That's what `finish()` figures out with one non-blocking `waitpid()` call,
 checking the child's real exit status:
 
-- **Exited with status 127** (the "command not found" convention from
-  §6.2) → the interpreter itself never even started → **`502 Bad
-  Gateway`**.
+- **Exited nonzero** — whether that's status 127 (the "command not found"
+  convention from §6.2, meaning the interpreter itself never even started)
+  or any other nonzero status (a script that crashed on its own, e.g. a
+  Python syntax error) — *and* produced no output → **`502 Bad Gateway`**.
+  A script can fail for reasons that have nothing to do with execve() —
+  the interpreter starts fine but the script itself errors out before
+  printing anything — and that's just as much "nothing usable to send
+  back" as an execve() failure is, so both collapse to the same check:
+  nonzero exit, empty stdout.
 - **Killed by a signal** (a segfault, for instance) *and* produced no
   output → also **`502`** — something genuinely broke, and there's nothing
   usable to send back.
@@ -1011,11 +1039,11 @@ bool finish(Connection& conn, pid_t& pendingPid) {
     if (reaped != conn.cgi_pid)
         return false;                 // <-- the race, handled: try again next poll()
 
-    bool execFailed = WIFEXITED(status) && WEXITSTATUS(status) == 127;
+    bool failedExit = WIFEXITED(status) && WEXITSTATUS(status) != 0;
     bool crashed = WIFSIGNALED(status);
     conn.cgi_pid = -1;
 
-    if ((execFailed || crashed) && conn.cgi_out.empty())
+    if ((failedExit || crashed) && conn.cgi_out.empty())
         request_handler::writeErrorResponse(conn, 502);
     else
         finishFromCgiOutput(conn, conn.cgi_out);
