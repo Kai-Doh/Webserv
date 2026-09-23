@@ -144,6 +144,11 @@ void	Server::dispatchEvents(void)
 
 /**
  * @brief Decide quoi faire d'un client a partir de son etat ET de ce que poll() a signale.
+ *        Regle de la grille : au plus UN read() OU UN write() par client et
+ *        par tour de poll(). Apres un handleRead(), on prepare la reponse
+ *        (handleProcessing, aucune I/O sur le socket) puis on s'arrete :
+ *        le write() attendra le POLLOUT du prochain tour, meme si revents
+ *        contenait aussi POLLHUP.
  * @param conn La Connection du client
  * @param revents Evenements signales par poll() pour ce fd lors de ce reveil
  */
@@ -155,7 +160,12 @@ void	Server::handleClientEvent(Connection& conn, short revents)
 		return ;
 	}
 	if (conn.state == READING_REQUEST && (revents & (POLLIN | POLLHUP)))
+	{
 		handleRead(conn);
+		if (conn.state == PROCESSING)
+			handleProcessing(conn);
+		return ;
+	}
 	if (conn.state == PROCESSING)
 		handleProcessing(conn);
 	if (conn.state == WRITING_RESPONSE && (revents & (POLLOUT | POLLHUP)))
