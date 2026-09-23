@@ -74,13 +74,41 @@ fd_count() {
     ls "/proc/$pid/fd" 2>/dev/null | wc -l | tr -d ' '
 }
 
+# Runs a siege command and prints its result, without trusting that siege's
+# exact report wording/format is the same across versions or platforms.
+# siege writes its stats block to stderr (not stdout) on at least some
+# builds, and older/newer versions phrase the summary differently -- a
+# plain `siege ... | grep "Availability"` can silently show NOTHING if
+# either of those doesn't match what's expected, with no indication
+# anything went wrong. Always captures full output to a log file first, so
+# there's something to fall back to (and to point at) either way.
+#   $1          = the command string to display ("$ ...")
+#   remaining   = the actual siege command to run
+run_siege() {
+    local display="$1"
+    shift
+    local out
+    out="$(mktemp /tmp/siege_run_XXXXXX.log)"
+    printf "${GREEN}\$ %s${RESET}\n" "$display"
+    "$@" >"$out" 2>&1
+    local filtered
+    filtered=$(grep -E "Transactions|Availability|Elapsed|Response time|Transaction rate|Concurrency|Successful|Failed|Longest|Shortest" "$out")
+    if [ -n "$filtered" ]; then
+        echo "$filtered"
+    else
+        printf "${YELLOW}(no summary line matched the usual siege wording -- showing the last 20 lines of raw output instead; your siege version/platform may format this differently)${RESET}\n"
+        tail -20 "$out"
+    fi
+    printf "${CYAN}full log: %s${RESET}\n" "$out"
+}
+
 # ---- siege scenarios --------------------------------------------------------
 
 siege_availability() {
     section "Availability check (eval sheet's literal ask: >99.5% on a plain GET)"
     ours
-    echo "\$ siege -b -t15S -c10 $BASE1/listing/a.txt"
-    siege -b -t15S -c10 "$BASE1/listing/a.txt" 2>&1 | grep -E "Transactions|Availability|Elapsed|Response time|Transaction rate|Concurrency|Successful|Failed|Longest|Shortest"
+    run_siege "siege -b -t15S -c10 $BASE1/listing/a.txt" \
+        siege -b -t15S -c10 "$BASE1/listing/a.txt"
     expected "Availability should read 100.00% (or at least >99.5% -- anything less on a plain static GET under a 15s/10-concurrent benchmark means requests are being dropped or timing out, which shouldn't happen on a single non-blocking poll() loop)."
 }
 
@@ -95,8 +123,8 @@ siege_memory_growth() {
     fi
     echo "webserv pid: $pid"
     echo "RSS before: $(rss_kb "$pid") KB"
-    echo "\$ siege -b -t30S -c15 $BASE1/listing/a.txt"
-    siege -b -t30S -c15 "$BASE1/listing/a.txt" 2>&1 | grep -E "Transactions|Availability|Failed"
+    run_siege "siege -b -t30S -c15 $BASE1/listing/a.txt" \
+        siege -b -t30S -c15 "$BASE1/listing/a.txt"
     echo "RSS after:  $(rss_kb "$pid") KB"
     expected "RSS after 30s of sustained concurrent load should be close to RSS before -- a few dozen KB of allocator overhead is normal, hundreds of MB or a value that keeps climbing on repeated runs is not. This is a proxy; scripts/valgrind_test.sh gives the actual tool-verified answer."
 }
@@ -108,8 +136,8 @@ siege_mixed_urls() {
         printf "${YELLOW}%s not found -- skipping.${RESET}\n" "$URLS_FILE"
         return
     fi
-    echo "\$ siege -b -t20S -c10 -f $URLS_FILE"
-    siege -b -t20S -c10 -f "$URLS_FILE" 2>&1 | grep -E "Transactions|Availability|Elapsed|Failed|Longest|Shortest"
+    run_siege "siege -b -t20S -c10 -f $URLS_FILE" \
+        siege -b -t20S -c10 -f "$URLS_FILE"
     expected "Same non-blocking poll() loop handling a realistic mix -- static files, a CGI script (real fork+exec per hit), a 404, and a 301 redirect -- all interleaved under load, not just one cheap static file repeated. Availability should still be at or near 100%."
 }
 
@@ -124,8 +152,8 @@ siege_concurrency_burst() {
     fi
     fds_before=$(fd_count "$pid")
     echo "open fds before: $fds_before"
-    echo "\$ siege -b -c50 -r20 $BASE1/listing/a.txt"
-    siege -b -c50 -r20 "$BASE1/listing/a.txt" 2>&1 | grep -E "Transactions|Availability|Failed|Concurrency"
+    run_siege "siege -b -c50 -r20 $BASE1/listing/a.txt" \
+        siege -b -c50 -r20 "$BASE1/listing/a.txt"
     sleep 1
     fds_after=$(fd_count "$pid")
     echo "open fds after:  $fds_after"
@@ -137,8 +165,8 @@ siege_cgi_focus() {
     ours
     local pid
     pid=$(server_pid)
-    echo "\$ siege -b -t20S -c10 $BASE1/cgi-bin/hello.py"
-    siege -b -t20S -c10 "$BASE1/cgi-bin/hello.py" 2>&1 | grep -E "Transactions|Availability|Failed|Longest|Shortest"
+    run_siege "siege -b -t20S -c10 $BASE1/cgi-bin/hello.py" \
+        siege -b -t20S -c10 "$BASE1/cgi-bin/hello.py"
     if [ -n "$pid" ]; then
         echo "child/zombie processes still attached to webserv: $(pgrep -P "$pid" | wc -l | tr -d ' ')"
     fi
